@@ -29,6 +29,10 @@
 
 namespace {
 
+constexpr uint32_t kBrk0 = 0xD4200000;  // "brk #0" on arm64 (sama seperti remote_call)
+constexpr uint64_t kScratchLen = 0x2000;  // halaman 1: path payload · halaman 2: trampolin brk
+constexpr uint64_t kTrampolineOff = 0x1000;
+
 FILE* g_log = nullptr;
 
 void log_line(const char* fmt, ...) {
@@ -127,22 +131,48 @@ int main(int argc, char** argv) {
     }
     log_line("remote mmap=0x%lx remote dlopen=0x%lx", remote_mmap, remote_dlopen);
 
-    // 1) allocate RW scratch in the target for the payload path string.
+    // 1) allocate scratch di proses game. Diutamakan RWX 2 halaman:
+    //    halaman pertama untuk path payload, halaman kedua berisi SATU
+    //    instruksi `brk` sebagai return marker (trampolin) — jadi `brk`
+    //    TIDAK PERNAH ditanam di PC main thread (alamat kode bersama
+    //    yang bisa dieksekusi thread lain → SIGTRAP → tombstone, v1.0.2).
+    //    Panggilan mmap PERTAMA ini sendiri masih memakai marker lama
+    //    (scratch belum ada — bootstrap satu syscall cepat, tak bisa
+    //    dihindari); semua panggilan sesudahnya pakai trampolin.
+    //    Bila perangkat menolak RWX (SELinux execmem), fallback ke RW +
+    //    marker lama (perilaku v1.0.2) supaya inject tidak mati total.
     uint64_t scratch = 0;
+    uintptr_t trampoline = 0;
     std::vector<uint64_t> mmap_args = {
         0,                                     // addr
-        0x1000,                                // length
-        PROT_READ | PROT_WRITE,                // prot
+        kScratchLen,                           // length
+        PROT_READ | PROT_WRITE | PROT_EXEC,    // prot
         MAP_ANONYMOUS | MAP_PRIVATE,            // flags
         static_cast<uint64_t>(-1),              // fd
         0                                        // offset
     };
-    if (!proc.call(remote_mmap, mmap_args, scratch) || scratch == 0 ||
-        scratch == static_cast<uint64_t>(-1)) {
-        log_err("remote mmap failed");
-        proc.detach();
-        if (g_log) std::fclose(g_log);
-        return 6;
+    if (proc.call(remote_mmap, mmap_args, scratch) && scratch != 0 &&
+        scratch != static_cast<uint64_t>(-1)) {
+        trampoline = scratch + kTrampolineOff;
+        if (!proc.write_mem(trampoline, &kBrk0, sizeof(kBrk0))) {
+            log_err("gagal tulis brk ke trampolin scratch 0x%lx", trampoline);
+            proc.detach();
+            if (g_log) std::fclose(g_log);
+            return 6;
+        }
+        log_line("scratch RWX 0x%lx, trampolin brk 0x%lx", scratch, trampoline);
+    } else {
+        log_line("mmap RWX ditolak — fallback RW + marker lama (v1.0.2)");
+        scratch = 0;
+        mmap_args[1] = 0x1000;
+        mmap_args[2] = PROT_READ | PROT_WRITE;
+        if (!proc.call(remote_mmap, mmap_args, scratch) || scratch == 0 ||
+            scratch == static_cast<uint64_t>(-1)) {
+            log_err("remote mmap failed");
+            proc.detach();
+            if (g_log) std::fclose(g_log);
+            return 6;
+        }
     }
 
     // 2) write the payload path into that scratch region.
@@ -154,10 +184,14 @@ int main(int argc, char** argv) {
         return 7;
     }
 
-    // 3) call dlopen(scratch, RTLD_NOW) in the target.
+    // 3) call dlopen(scratch, RTLD_NOW) in the target — budget 10 dtk
+    //    (v1.0.2: ~2 dtk efektif, bahkan kurang karena bug CONT-di-loop;
+    //    dlopen yang dipotong di tengah jalan meninggalkan linker-lock
+    //    rusak). Bila timeout, call() tetap menunggu sampai breakpoint
+    //    kena / proses mati (batas total 25 dtk), tanpa restore buta.
     uint64_t handle = 0;
     std::vector<uint64_t> dlopen_args = {scratch, RTLD_NOW};
-    bool called = proc.call(remote_dlopen, dlopen_args, handle);
+    bool called = proc.call(remote_dlopen, dlopen_args, handle, trampoline, 10000);
 
     if (!called) {
         log_err("remote dlopen call did not complete");
@@ -169,7 +203,7 @@ int main(int argc, char** argv) {
         // Baca alasan linker yang sebenarnya lewat dlerror() remote.
         uint64_t err_ptr = 0;
         std::vector<uint64_t> no_args;
-        if (proc.call(remote_dlerror, no_args, err_ptr) && err_ptr != 0) {
+        if (proc.call(remote_dlerror, no_args, err_ptr, trampoline) && err_ptr != 0) {
             char err_buf[1024] = {0};
             if (proc.read_mem(err_ptr, err_buf, sizeof(err_buf) - 1)) {
                 log_err("remote dlopen returned NULL. dlerror: %s", err_buf);

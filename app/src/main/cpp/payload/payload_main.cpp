@@ -3,8 +3,8 @@
 // Constructor WAJIB kembali CEPAT: ia hanya menulis ctor log, lalu
 // spawn worker thread (sniper3d::start_worker) dan kembali. Semua
 // kerja berat (resolve IL2CPP, hook, fitur) jalan di worker thread —
-// kalau constructor menahan dlopen, remote call injector (budget ~2
-// dtk) timeout dan MainActivity mengira inject gagal.
+// kalau constructor menahan dlopen, remote call injector (budget
+// dlopen 10 dtk sejak v1.0.3) timeout dan MainActivity mengira inject gagal.
 //
 // Ctor log membuktikan constructor sempat KEMBALI:
 //   CTOR=masuk  → constructor mulai

@@ -572,6 +572,14 @@ void enumerate_and_target() {
     float bestScore = 1e9f;
     CachedTarget best;
     for (Il2CppObject* person : persons) {
+        // MITIGASI PARSIAL (v1.0.3): enumerasi + baca field masih jalan
+        // dari worker thread (API Unity resmi main-thread-only) — baca
+        // objek yang sudah di-destroy antara enumerasi dan baca bisa
+        // SIGSEGV. Cek class dulu: menangkap objek yang memorinya sudah
+        // dipakai ulang / di-nol-kan. BUKAN perbaikan penuh: pindah
+        // enumerasi ke main thread butuh hook per-frame terverifikasi
+        // (belum ada titik hook yang aman dari REA) — jangan klaim penuh.
+        if (!g.object_get_class(person)) continue;
         bool alive = false, dead = false;
         double health = 0;
         field_get(person, g.personAlive, alive);
@@ -670,9 +678,13 @@ void apply_features(const Config& prev) {
     auto weapons = find_objects(g.weaponClass);
 
     // No-spread: _spreadAmount = 0 + WeaponData.Spread = 0.
+    // v1.0.2: _spreadAmount selalu di-nol-kan di misi meski toggle OFF.
     for (Il2CppObject* weapon : weapons) {
+        if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
         float zero = 0.0f;
-        field_set(weapon, g.weaponSpreadAmount, zero);
+        if (g.config.noSpread) {
+            field_set(weapon, g.weaponSpreadAmount, zero);
+        }
         if (g.config.noSpread) {
             Il2CppObject* data = nullptr;
             field_get(weapon, g.weaponDataField, data);
@@ -693,6 +705,7 @@ void apply_features(const Config& prev) {
     // No-spread dimatikan → kembalikan Spread senjata yang masih hidup.
     if (prev.noSpread && !g.config.noSpread && g.dataSetSpread) {
         for (Il2CppObject* weapon : weapons) {
+            if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
             Il2CppObject* data = nullptr;
             field_get(weapon, g.weaponDataField, data);
             if (!data) continue;
@@ -709,6 +722,7 @@ void apply_features(const Config& prev) {
     auto shooters = find_objects(g.shooterClass);
     if (!shooters.empty()) {
         Il2CppObject* shooter = shooters[0];
+        if (!g.object_get_class(shooter)) return;  // objek sudah di-destroy
         Il2CppObject* data = nullptr;
         field_get(shooter, g.shooterWeaponData, data);
         if (data) {
@@ -754,7 +768,11 @@ void apply_features(const Config& prev) {
     }
 
     // Zoom jauh — InputUtils.Zoom.ScaleMax (static field).
-    if (g.config.zoomFar && g.zoomScaleMax) {
+    // Guard pointer API-nya: load_il2cpp_api mencatat bila simbol tak
+    // ada (g.failed) tapi tidak menggagalkan resolve — pemanggilan
+    // function pointer null di sini akan SIGSEGV.
+    if (g.config.zoomFar && g.zoomScaleMax && g.field_static_get_value &&
+        g.field_static_set_value) {
         if (!g.zoomScaleMaxSaved) {
             float orig = 0;
             g.field_static_get_value(g.zoomScaleMax, &orig);
@@ -764,7 +782,8 @@ void apply_features(const Config& prev) {
         float v = 30.0f;
         g.field_static_set_value(g.zoomScaleMax, &v);
     }
-    if (prev.zoomFar && !g.config.zoomFar && g.zoomScaleMax && g.zoomScaleMaxSaved) {
+    if (prev.zoomFar && !g.config.zoomFar && g.zoomScaleMax && g.zoomScaleMaxSaved &&
+        g.field_static_set_value) {
         float v = g.zoomScaleMaxOrig;
         g.field_static_set_value(g.zoomScaleMax, &v);
     }
@@ -808,6 +827,7 @@ Il2CppArray* hook_ShootTest(void* thiz, Ray* ray, int32_t layerMask, void* metho
 void try_install_hook() {
     auto shooters = find_objects(g.shooterClass);
     if (shooters.empty()) return;
+    if (!g.object_get_class(shooters[0])) return;  // objek sudah di-destroy
     Il2CppObject* weapon = nullptr;
     field_get(shooters[0], g.shooterWeapon, weapon);
     if (!weapon) return;
@@ -839,6 +859,10 @@ void try_install_hook() {
 
 // ---------------------------------------------------------------- worker
 void* worker_main(void*) {
+    // Jejak pertama SEBELUM resolve: bila crash terjadi saat resolve,
+    // status INIT tetap ada (v1.0.2: tanpa ini, crash sebelum READY
+    // tidak meninggalkan jejak apa pun).
+    write_status("INIT");
     // Resolve (retry s.d. 60 dtk — libil2cpp mungkin belum siap).
     long long start = now_ms();
     while (!g.coreResolved) {
@@ -897,9 +921,16 @@ void* worker_main(void*) {
 // sniper3d.h dan dipanggil dari payload_main.cpp — bila ikut masuk
 // anonymous namespace, linkage-nya internal dan linker tak menemukannya.
 void start_worker() {
+    // v1.0.2 hanya menangkap SIGSEGV/SIGABRT/SIGBUS — crash SIGILL /
+    // SIGFPE / SIGTRAP / SIGSYS tidak meninggalkan STATUS=CRASH sama
+    // sekali ("gak ada" di tes POCO v1.0.2).
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGBUS, crash_handler);
+    signal(SIGILL, crash_handler);
+    signal(SIGFPE, crash_handler);
+    signal(SIGTRAP, crash_handler);
+    signal(SIGSYS, crash_handler);
     pthread_t th;
     if (pthread_create(&th, nullptr, worker_main, nullptr) == 0) {
         pthread_detach(th);

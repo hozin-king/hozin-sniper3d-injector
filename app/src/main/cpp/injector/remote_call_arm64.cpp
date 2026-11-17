@@ -10,6 +10,7 @@
 #include <sys/ptrace.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LOG_TAG "HozinSniper3D"
@@ -19,8 +20,9 @@
 namespace injector {
 
 namespace {
-constexpr int kMaxWaitRetries = 200;    // ~2s total at kWaitRetryUsec per retry
-constexpr int kWaitRetryUsec = 10000;
+constexpr int kWaitRetryUsec = 10000;   // 10 ms per poll waitpid
+constexpr int kDefaultWaitMs = 2000;    // budget default (mmap/dlerror)
+constexpr int kMaxTotalWaitMs = 25000;  // batas total tunggu — di bawah timeout shell 30 dtk
 constexpr uint32_t kBrk0 = 0xD4200000;  // "brk #0" on arm64
 }  // namespace
 
@@ -74,9 +76,13 @@ bool RemoteProcess::write_mem(uintptr_t addr, const void* buf, size_t len) const
     return n == static_cast<ssize_t>(len);
 }
 
-bool RemoteProcess::call(uintptr_t func_addr, const std::vector<uint64_t>& args, uint64_t& result) {
+bool RemoteProcess::call(uintptr_t func_addr, const std::vector<uint64_t>& args,
+                         uint64_t& result, uintptr_t trampoline, int max_wait_ms) {
     if (!attached_ || args.size() > 8) {
         return false;
+    }
+    if (max_wait_ms <= 0) {
+        max_wait_ms = kDefaultWaitMs;
     }
 
     struct user_pt_regs saved_regs {};
@@ -91,41 +97,103 @@ bool RemoteProcess::call(uintptr_t func_addr, const std::vector<uint64_t>& args,
         work_regs.regs[i] = args[i];
     }
 
-    uintptr_t return_marker = saved_regs.pc;
+    // Return marker: trampolin scratch (milik kita, tak ada thread lain
+    // yang menyentuhnya) bila diberi; kalau tidak — hanya bootstrap mmap
+    // pertama — PC main thread, dengan instruksi aslinya dipulihkan.
+    const bool use_trampoline = trampoline != 0;
+    uintptr_t return_marker = use_trampoline ? trampoline : saved_regs.pc;
     work_regs.pc = func_addr;
     work_regs.regs[30] = return_marker;      // x30 / LR
     work_regs.sp = saved_regs.sp & ~0xFULL;  // AAPCS64 16-byte alignment
 
+    bool planted = false;
     uint32_t original_insn = 0;
-    if (!read_mem(return_marker, &original_insn, sizeof(original_insn))) {
-        LOGE("failed to read original instruction at return marker 0x%lx", return_marker);
-        return false;
-    }
-    if (!write_mem(return_marker, &kBrk0, sizeof(kBrk0))) {
-        LOGE("failed to plant breakpoint at 0x%lx", return_marker);
-        return false;
+    if (use_trampoline) {
+        // Scratch milik kita: tak ada instruksi asli yang perlu dipulihkan.
+        if (!write_mem(return_marker, &kBrk0, sizeof(kBrk0))) {
+            LOGE("failed to plant breakpoint at trampoline 0x%lx", return_marker);
+            return false;
+        }
+        planted = true;
+    } else {
+        if (!read_mem(return_marker, &original_insn, sizeof(original_insn))) {
+            LOGE("failed to read original instruction at return marker 0x%lx", return_marker);
+            return false;
+        }
+        if (!write_mem(return_marker, &kBrk0, sizeof(kBrk0))) {
+            LOGE("failed to plant breakpoint at 0x%lx", return_marker);
+            return false;
+        }
+        planted = true;
     }
 
     struct iovec set_iov{&work_regs, sizeof(work_regs)};
     if (ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_PRSTATUS), &set_iov) != 0) {
         LOGE("PTRACE_SETREGSET failed: %s", std::strerror(errno));
-        write_mem(return_marker, &original_insn, sizeof(original_insn));
+        if (!use_trampoline && planted) {
+            write_mem(return_marker, &original_insn, sizeof(original_insn));
+        }
         return false;
     }
 
-    bool hit = false;
-    for (int i = 0; i < kMaxWaitRetries && !hit; ++i) {
-        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) != 0) {
-            LOGE("PTRACE_CONT failed: %s", std::strerror(errno));
-            break;
+    // PTRACE_CONT sekali, lalu poll waitpid — JANGAN CONT di tiap
+    // iterasi (v1.0.2: CONT pada thread yang sedang jalan gagal ESRCH
+    // dan memotong loop, jadi budget efektifnya hanya ~10-20 ms, bukan
+    // ~2 dtk). Stop yang bukan breakpoint kita (mis. SIGSTOP) di-CONT
+    // lagi dari dalam loop.
+    if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) != 0) {
+        LOGE("PTRACE_CONT failed: %s", std::strerror(errno));
+        if (!use_trampoline && planted) {
+            write_mem(return_marker, &original_insn, sizeof(original_insn));
         }
+        struct iovec restore_iov{&saved_regs, sizeof(saved_regs)};
+        ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_PRSTATUS), &restore_iov);
+        return false;
+    }
+
+    struct timespec start_ts {};
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    auto elapsed_ms = [&]() -> long {
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return (now.tv_sec - start_ts.tv_sec) * 1000L +
+               (now.tv_nsec - start_ts.tv_nsec) / 1000000L;
+    };
+
+    bool hit = false;
+    bool process_dead = false;
+    bool gave_up = false;
+    bool warned_over_budget = false;
+    while (!hit && !process_dead && !gave_up) {
         int status = 0;
         pid_t w = waitpid(pid_, &status, WNOHANG);
         if (w == 0) {
+            if (elapsed_ms() >= kMaxTotalWaitMs) {
+                LOGE("remote call ke 0x%lx tak selesai setelah %d ms — pulihkan register "
+                     "sebagai jalan terakhir (proses hampir pasti macet)",
+                     func_addr, kMaxTotalWaitMs);
+                gave_up = true;
+                break;
+            }
+            if (elapsed_ms() >= max_wait_ms && !warned_over_budget) {
+                warned_over_budget = true;
+                LOGI("remote call ke 0x%lx melewati budget %d ms — tetap menunggu breakpoint "
+                     "atau proses mati",
+                     func_addr, max_wait_ms);
+            }
             usleep(kWaitRetryUsec);
             continue;
         }
         if (w < 0) {
+            if (errno == EINTR) continue;
+            // ECHILD: proses sudah mati / tak ada lagi anak yang ditunggu.
+            process_dead = true;
+            break;
+        }
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            LOGE("target pid %d mati saat remote call ke 0x%lx (status 0x%x)",
+                 pid_, func_addr, status);
+            process_dead = true;
             break;
         }
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
@@ -138,16 +206,31 @@ bool RemoteProcess::call(uintptr_t func_addr, const std::vector<uint64_t>& args,
                 result = check_regs.regs[0];
                 break;
             }
+            // SIGTRAP lain (bukan breakpoint kita) — lanjutkan thread.
+        }
+        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) != 0) {
+            LOGE("PTRACE_CONT (lanjutkan setelah stop) failed: %s", std::strerror(errno));
+            break;
         }
     }
 
-    write_mem(return_marker, &original_insn, sizeof(original_insn));
+    // Pulihkan instruksi asli hanya untuk marker lama; scratch trampolin
+    // milik kita dan boleh tetap berisi brk.
+    if (!use_trampoline && planted) {
+        write_mem(return_marker, &original_insn, sizeof(original_insn));
+    }
 
-    struct iovec restore_iov{&saved_regs, sizeof(saved_regs)};
-    ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_PRSTATUS), &restore_iov);
+    // Proses mati → tak ada yang bisa dipulihkan. Bila menyerah karena
+    // batas total, kembalikan register tersimpan supaya thread lanjut
+    // dari keadaan semula (jalan terakhir, tercatat di log di atas).
+    if (!process_dead) {
+        struct iovec restore_iov{&saved_regs, sizeof(saved_regs)};
+        ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_PRSTATUS), &restore_iov);
+    }
 
     if (!hit) {
-        LOGE("remote call to 0x%lx never hit the return breakpoint", func_addr);
+        LOGE("remote call to 0x%lx tidak selesai (proses mati=%d)", func_addr,
+             static_cast<int>(process_dead));
     }
     return hit;
 }

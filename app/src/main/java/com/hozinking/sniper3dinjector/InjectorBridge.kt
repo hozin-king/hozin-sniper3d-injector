@@ -392,7 +392,11 @@ object InjectorBridge {
                     return InjectResult(0, "", full)
                 }
             }
-            val r = RootUtil.su("'$injector' $pid $path")
+            // Timeout 30 dtk (v1.0.3): injector bisa menunggu dlopen
+            // lambat s.d. ~25 dtk sebelum menyerah — timeout shell 15 dtk
+            // (default) akan membunuhnya di tengah tunggu dan
+            // meninggalkan thread game kembali ke brk tanpa tracer.
+            val r = RootUtil.su("'$injector' $pid $path", 30)
             var diag = r.output.trim()
             if (diag.isEmpty()) {
                 val log = RootUtil.su("cat '$INJECT_LOG' 2>/dev/null")
