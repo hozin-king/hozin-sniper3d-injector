@@ -9,7 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.hozinking.sniper3dinjector.databinding.ActivityMainBinding
 
 /**
- * Hozin Sniper 3D Injector v1.0.2 — launcher root untuk Sniper 3D
+ * Hozin Sniper 3D Injector v1.0.5 — launcher root untuk Sniper 3D
  * (com.fungames.sniper3d) v7.15.0, Unity 6 IL2CPP. Game TIDAK dibundel —
  * user install sendiri dari Play Store.
  *
@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
     private fun runAutoInject() {
         autoRunning = true
         try {
-            log("== Inject v1.0.2 — alur otomatis ==")
+            log("== Inject v${BuildConfig.VERSION_NAME} — alur otomatis ==")
             // Tombol mengambang muncul duluan — anti gagal.
             FloatingService.start(this)
 

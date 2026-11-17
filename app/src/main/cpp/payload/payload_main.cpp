@@ -44,7 +44,7 @@ void write_ctor(const char* line) {
 
 __attribute__((constructor)) static void on_load() {
     write_ctor("CTOR=masuk");
-    LOGI("payload Hozin Sniper 3D v1.0 masuk ke proses game");
+    LOGI("payload Hozin Sniper 3D v1.0.5 masuk ke proses game");
     sniper3d::start_worker();
     write_ctor("CTOR=kembali");
     LOGI("payload constructor kembali — worker jalan");

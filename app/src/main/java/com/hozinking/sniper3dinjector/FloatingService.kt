@@ -45,6 +45,7 @@ class FloatingService : Service() {
     private var menuView: LinearLayout? = null
     private var espView: EspView? = null
     private var modeText: TextView? = null
+    private var menuParams: WindowManager.LayoutParams? = null
 
     @Volatile
     private var polling = false
@@ -177,10 +178,36 @@ class FloatingService : Service() {
             setBackgroundColor(0xDD111111.toInt())
             setPadding(24, 20, 24, 20)
         }
+        // Judul = gagang geser menu (v1.0.5 — keluhan user: "kotak
+        // floating gak bisa digeser"). Tombol 🎯 sudah bisa digeser
+        // sejak awal; yang tidak bisa digeser adalah PANEL menu ini.
+        // Drag hanya di judul supaya tap pada Switch tetap bekerja.
         val title = TextView(this).apply {
-            text = "Hozin Sniper 3D v1.0.2"
+            text = "Hozin Sniper 3D v${BuildConfig.VERSION_NAME}"
             textSize = 17f
             setTextColor(0xFFFFFFFF.toInt())
+        }
+        var dragDownX = 0f
+        var dragDownY = 0f
+        title.setOnTouchListener { _, ev ->
+            val p = menuParams ?: return@setOnTouchListener false
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragDownX = ev.rawX - p.x
+                    dragDownY = ev.rawY - p.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    p.x = (ev.rawX - dragDownX).toInt()
+                    p.y = (ev.rawY - dragDownY).toInt()
+                    try {
+                        menuView?.let { wm?.updateViewLayout(it, p) }
+                    } catch (_: Exception) {
+                    }
+                    true
+                }
+                else -> false
+            }
         }
         layout.addView(title)
         modeText = TextView(this).apply {
@@ -190,7 +217,7 @@ class FloatingService : Service() {
         }
         layout.addView(modeText!!)
         val hint = TextView(this).apply {
-            text = "Fitur hanya aktif di MISI (solo vs AI).\nDi Arena semua MATI otomatis."
+            text = "Fitur hanya aktif di MISI (solo vs AI).\nDi Arena semua MATI otomatis.\nGeser menu dari baris judul."
             textSize = 12f
             setTextColor(0xFFCCCCCC.toInt())
         }
@@ -242,6 +269,7 @@ class FloatingService : Service() {
                 y = 420
             }
             val menu = buildMenu()
+            menuParams = params
             menuView = menu
             manager.addView(menu, params)
         } else {
@@ -250,6 +278,7 @@ class FloatingService : Service() {
             } catch (_: Exception) {
             }
             menuView = null
+            menuParams = null
         }
     }
 

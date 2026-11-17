@@ -18,12 +18,16 @@
 // ganti senjata ke subclass lain, hook dipasang ulang). Hook menulis
 // ulang ray (origin = posisi kamera, direction = ke kepala target)
 // lalu memanggil original. Target = musuh hidup terdekat dari tengah
-// layar, dihitung worker thread tiap 100 ms dan di-cache.
+// layar, dihitung pompa main-thread (hook LevelController.Update)
+// tiap 100 ms dan di-cache — worker thread TIDAK PERNAH memanggil
+// API Unity (v1.0.5: pemanggilan FindObjectsOfType dkk dari worker
+// thread adalah tersangka utama crash setelah inject, tes POCO v1.0.4).
 #include "il2cpp_api.h"
 #include "sniper3d.h"
 
 #include <algorithm>
 #include <android/log.h>
+#include <atomic>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -79,6 +83,10 @@ struct WeaponDataOrig {
     float maxZoom = 0;
     bool saved = false;
 };
+
+// LevelController.Update — hook pompa main-thread (v1.0.5).
+// Update adalah instance method tanpa argumen: (this, method).
+typedef void (*LevelUpdateFn)(void* thiz, void* method);
 
 struct State {
     // libil2cpp
@@ -150,19 +158,35 @@ struct State {
     Il2CppField* shooterWeaponData = nullptr;    // CharacterShooter._weaponData
     Il2CppField* zoomScaleMax = nullptr;         // static float
 
-    bool coreResolved = false;
+    // Atomic: ditulis worker (resolve), dibaca pompa (main thread).
+    std::atomic<bool> coreResolved{false};
     bool hookInstalled = false;
+    bool pumpHookInstalled = false;
     std::vector<void*> hookedMethods;
     std::vector<std::string> failed;
     Mode mode = Mode::UNKNOWN;
     Config config;
-    std::mutex targetMutex;
+    // SATU mutex untuk semua state bersama worker <-> pompa <-> hook:
+    // mode, config, target, entri ESP, isZooming, hookInstalled, failed.
+    // TIDAK PERNAH dipegang saat memanggil API Unity (panggilan Unity
+    // jalan di luar lock; publish hasil di bawah lock) — jadi tidak ada
+    // deadlock dan tidak ada lock yang menahan main thread lama.
+    std::mutex stateMutex;
     CachedTarget target;
+    // Config sebelumnya untuk logika restore apply_features — hanya
+    // disentuh pompa (main thread).
+    Config prevPumpConfig;
+    // Timestamp pompa terakhir (main thread) — worker membaca untuk
+    // deteksi basi (level selesai / menu / Update tak jalan). Atomic
+    // supaya worker bisa baca tanpa lock tiap 150 ms.
+    std::atomic<long long> lastPumpMs{0};
+    long long lastPumpModeMs = 0;
+    long long lastEnumerateMs = 0;
+    long long lastPumpHookMs = 0;
     float zoomScaleMaxOrig = 0;
     bool zoomScaleMaxSaved = false;
     std::map<void*, WeaponDataOrig> weaponDataOrig;
     long long lastConfigReadMs = 0;
-    long long lastModeCheckMs = 0;
     long long lastHookCheckMs = 0;
     long long lastEspWriteMs = 0;
     long long lastStatusWriteMs = 0;
@@ -197,14 +221,28 @@ std::string read_file(const char* path) {
 }
 
 void write_status(const std::string& status) {
+    // Snapshot state bersama di bawah lock — pompa (main thread) yang
+    // menulis mode/failed/hookInstalled.
+    std::vector<std::string> failedCopy;
+    Mode mode;
+    bool hookOk;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        failedCopy = g.failed;
+        mode = g.mode;
+        hookOk = g.hookInstalled;
+    }
+    // Pompa berhenti >500 ms (level selesai / menu / Update tak jalan)
+    // → mode yang dilaporkan UNKNOWN (basi), bukan MISI beku.
+    if (now_ms() - g.lastPumpMs.load() > 500) mode = Mode::UNKNOWN;
     std::string content = "STATUS=" + status + "\n";
     content += "FAILED=";
-    if (g.failed.empty()) {
+    if (failedCopy.empty()) {
         content += "-\n";
     } else {
-        for (size_t i = 0; i < g.failed.size(); i++) {
+        for (size_t i = 0; i < failedCopy.size(); i++) {
             if (i) content += ",";
-            content += g.failed[i];
+            content += failedCopy[i];
         }
         content += "\n";
     }
@@ -222,10 +260,10 @@ void write_status(const std::string& status) {
     }
     content += "\n";
     content += "MODE=";
-    content += (g.mode == Mode::MISI ? "MISI" : g.mode == Mode::ARENA ? "ARENA" : "UNKNOWN");
+    content += (mode == Mode::MISI ? "MISI" : mode == Mode::ARENA ? "ARENA" : "UNKNOWN");
     content += "\n";
     content += "HOOK=";
-    content += (g.hookInstalled ? "ok" : "gagal");
+    content += (hookOk ? "ok" : "gagal");
     content += "\n";
     g.lastStatus = status;
     write_file(kStatusCache, content);
@@ -250,6 +288,20 @@ void crash_handler(int sig) {
     raise(sig);
 }
 
+// Catat satu nama yang gagal resolve — dedup, di bawah lock (dipanggil
+// pompa main-thread dan worker; write_status membaca dari worker).
+void add_failed(const std::string& name) {
+    std::lock_guard<std::mutex> lock(g.stateMutex);
+    if (std::find(g.failed.begin(), g.failed.end(), name) == g.failed.end()) {
+        g.failed.push_back(name);
+    }
+}
+
+bool failed_empty() {
+    std::lock_guard<std::mutex> lock(g.stateMutex);
+    return g.failed.empty();
+}
+
 // ---------------------------------------------------------------- config
 bool config_flag(const std::string& json, const char* key) {
     std::string pat = std::string("\"") + key + "\":true";
@@ -259,12 +311,16 @@ bool config_flag(const std::string& json, const char* key) {
 void read_config() {
     std::string json = read_file(kConfigPath);
     if (json.empty()) return;
-    g.config.aimbot = config_flag(json, "aimbot");
-    g.config.zoomAim = config_flag(json, "zoomaim");
-    g.config.esp = config_flag(json, "esp");
-    g.config.noSpread = config_flag(json, "nospread");
-    g.config.noReload = config_flag(json, "noreload");
-    g.config.zoomFar = config_flag(json, "zoom");
+    Config c;
+    c.aimbot = config_flag(json, "aimbot");
+    c.zoomAim = config_flag(json, "zoomaim");
+    c.esp = config_flag(json, "esp");
+    c.noSpread = config_flag(json, "nospread");
+    c.noReload = config_flag(json, "noreload");
+    c.zoomFar = config_flag(json, "zoom");
+    // Publish di bawah lock — pompa (main thread) membaca snapshot ini.
+    std::lock_guard<std::mutex> lock(g.stateMutex);
+    g.config = c;
 }
 
 // ---------------------------------------------------------------- il2cpp
@@ -535,20 +591,20 @@ int screen_height() {
 // controller Arena TIDAK jalan. Bila ada class gate yang tak ter-resolve
 // → UNKNOWN → semua fitur MATI.
 void update_mode() {
-    if (!g.levelClass || !g.arenaClass || !g.arenaFluxClass) {
-        g.mode = Mode::UNKNOWN;
-        return;
+    Mode m = Mode::UNKNOWN;
+    if (g.levelClass && g.arenaClass && g.arenaFluxClass) {
+        bool level = !find_objects(g.levelClass).empty();
+        bool arena = !find_objects(g.arenaClass).empty();
+        bool flux = !find_objects(g.arenaFluxClass).empty();
+        if (level && !arena && !flux) {
+            m = Mode::MISI;
+        } else if (arena || flux) {
+            m = Mode::ARENA;
+        }
     }
-    bool level = !find_objects(g.levelClass).empty();
-    bool arena = !find_objects(g.arenaClass).empty();
-    bool flux = !find_objects(g.arenaFluxClass).empty();
-    if (level && !arena && !flux) {
-        g.mode = Mode::MISI;
-    } else if (arena || flux) {
-        g.mode = Mode::ARENA;
-    } else {
-        g.mode = Mode::UNKNOWN;
-    }
+    // Panggilan Unity di atas jalan di luar lock; assign di bawah lock.
+    std::lock_guard<std::mutex> lock(g.stateMutex);
+    g.mode = m;
 }
 
 // ---------------------------------------------------------------- ESP + target
@@ -561,7 +617,11 @@ std::vector<EspEntry> g_espEntries;
 bool g_isZooming = false;
 
 void enumerate_and_target() {
-    g_espEntries.clear();
+    // v1.0.5: fungsi ini HANYA dipanggil dari pompa main-thread
+    // (hook LevelController.Update) — semua API Unity di sini legal.
+    // JANGAN panggil dari worker thread (crash tes POCO v1.0.4:
+    // dlopen OK, game mati, status tak pernah READY).
+    std::vector<EspEntry> entries;
     Il2CppObject* camera = get_main_camera();
     if (!camera) return;
     int sw = screen_width();
@@ -572,13 +632,8 @@ void enumerate_and_target() {
     float bestScore = 1e9f;
     CachedTarget best;
     for (Il2CppObject* person : persons) {
-        // MITIGASI PARSIAL (v1.0.3): enumerasi + baca field masih jalan
-        // dari worker thread (API Unity resmi main-thread-only) — baca
-        // objek yang sudah di-destroy antara enumerasi dan baca bisa
-        // SIGSEGV. Cek class dulu: menangkap objek yang memorinya sudah
-        // dipakai ulang / di-nol-kan. BUKAN perbaikan penuh: pindah
-        // enumerasi ke main thread butuh hook per-frame terverifikasi
-        // (belum ada titik hook yang aman dari REA) — jangan klaim penuh.
+        // Objek bisa di-destroy antara enumerasi dan baca — cek class
+        // dulu (menangkap memori yang sudah dipakai ulang / di-nol-kan).
         if (!g.object_get_class(person)) continue;
         bool alive = false, dead = false;
         double health = 0;
@@ -617,7 +672,7 @@ void enumerate_and_target() {
         float boxH = dist > 0.5f ? (1.5f * (float)sh / dist) : (float)sh;
         if (boxH > sh) boxH = (float)sh;
         float boxW = boxH * 0.45f;
-        g_espEntries.push_back({sx, sy, boxW, boxH, hpRatio, dist, "Person"});
+        entries.push_back({sx, sy, boxW, boxH, hpRatio, dist, "Person"});
 
         float dx = sx - sw / 2.0f;
         float dy = sy - sh / 2.0f;
@@ -634,24 +689,42 @@ void enumerate_and_target() {
             }
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(g.targetMutex);
-        g.target = best;
-    }
+    bool zooming = false;
     if (g.zoomGetIsZoomingIn) {
-        bool z = false;
-        invoke_value<bool>(g.zoomGetIsZoomingIn, nullptr, nullptr, z);
-        g_isZooming = z;
+        invoke_value<bool>(g.zoomGetIsZoomingIn, nullptr, nullptr, zooming);
+    }
+    // Publish hasil ke worker/hook di bawah SATU lock singkat.
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        g_espEntries = std::move(entries);
+        g.target = best;
+        g_isZooming = zooming;
     }
 }
 
 void write_esp() {
+    // Snapshot di bawah lock — pompa (main thread) yang menulisnya.
+    Mode mode;
+    bool espOn;
+    std::vector<EspEntry> entries;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        mode = g.mode;
+        espOn = g.config.esp;
+        entries = g_espEntries;
+    }
+    // Pompa berhenti >500 ms (level selesai / menu / Update tak jalan)
+    // → entri basi: jangan tampilkan kotak beku — kosongkan + UNKNOWN.
+    if (now_ms() - g.lastPumpMs.load() > 500) {
+        mode = Mode::UNKNOWN;
+        entries.clear();
+    }
     std::string json = "{\"mode\":\"";
-    json += (g.mode == Mode::MISI ? "MISI" : g.mode == Mode::ARENA ? "ARENA" : "UNKNOWN");
+    json += (mode == Mode::MISI ? "MISI" : mode == Mode::ARENA ? "ARENA" : "UNKNOWN");
     json += "\",\"t\":[";
-    if (g.config.esp && g.mode == Mode::MISI) {
+    if (espOn && mode == Mode::MISI) {
         bool first = true;
-        for (const auto& e : g_espEntries) {
+        for (const auto& e : entries) {
             if (!first) json += ",";
             first = false;
             char buf[256];
@@ -673,8 +746,17 @@ WeaponDataOrig& orig_for(void* dataObj) {
     return g.weaponDataOrig[dataObj];
 }
 
-void apply_features(const Config& prev) {
-    if (g.mode != Mode::MISI) return;
+// v1.0.5: HANYA dipanggil dari pompa main-thread. cfg = snapshot
+// config yang dipublish worker; prev = config pompa sebelumnya
+// (untuk restore nilai asli saat toggle dimatikan).
+void apply_features(const Config& cfg, const Config& prev) {
+    // Hanya di MISI — pompa sudah memeriksa, tapi jaga di sini juga.
+    Mode mode;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        mode = g.mode;
+    }
+    if (mode != Mode::MISI) return;
     auto weapons = find_objects(g.weaponClass);
 
     // No-spread: _spreadAmount = 0 + WeaponData.Spread = 0.
@@ -682,10 +764,10 @@ void apply_features(const Config& prev) {
     for (Il2CppObject* weapon : weapons) {
         if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
         float zero = 0.0f;
-        if (g.config.noSpread) {
+        if (cfg.noSpread) {
             field_set(weapon, g.weaponSpreadAmount, zero);
         }
-        if (g.config.noSpread) {
+        if (cfg.noSpread) {
             Il2CppObject* data = nullptr;
             field_get(weapon, g.weaponDataField, data);
             if (data && g.dataSetSpread && g.dataGetSpread) {
@@ -703,7 +785,7 @@ void apply_features(const Config& prev) {
         }
     }
     // No-spread dimatikan → kembalikan Spread senjata yang masih hidup.
-    if (prev.noSpread && !g.config.noSpread && g.dataSetSpread) {
+    if (prev.noSpread && !cfg.noSpread && g.dataSetSpread) {
         for (Il2CppObject* weapon : weapons) {
             if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
             Il2CppObject* data = nullptr;
@@ -737,7 +819,7 @@ void apply_features(const Config& prev) {
                 o.maxZoom = m;
                 o.saved = true;
             }
-            if (g.config.noReload && g.dataSetReloadTime && g.shooterSetCurrentAmmo &&
+            if (cfg.noReload && g.dataSetReloadTime && g.shooterSetCurrentAmmo &&
                 g.dataGetClipSize) {
                 // ReloadTime = 0 (reload instan) + ammo selalu penuh.
                 float z = 0;
@@ -749,17 +831,17 @@ void apply_features(const Config& prev) {
                     invoke_obj(g.shooterSetCurrentAmmo, shooter, ap);
                 }
             }
-            if (prev.noReload && !g.config.noReload && g.dataSetReloadTime && o.saved) {
+            if (prev.noReload && !cfg.noReload && g.dataSetReloadTime && o.saved) {
                 float r = o.reloadTime;
                 void* params[1] = {&r};
                 invoke_obj(g.dataSetReloadTime, data, params);
             }
-            if (g.config.zoomFar && g.dataSetMaxZoom) {
+            if (cfg.zoomFar && g.dataSetMaxZoom) {
                 float mz = 30.0f;
                 void* params[1] = {&mz};
                 invoke_obj(g.dataSetMaxZoom, data, params);
             }
-            if (prev.zoomFar && !g.config.zoomFar && g.dataSetMaxZoom && o.saved) {
+            if (prev.zoomFar && !cfg.zoomFar && g.dataSetMaxZoom && o.saved) {
                 float m = o.maxZoom;
                 void* params[1] = {&m};
                 invoke_obj(g.dataSetMaxZoom, data, params);
@@ -771,7 +853,7 @@ void apply_features(const Config& prev) {
     // Guard pointer API-nya: load_il2cpp_api mencatat bila simbol tak
     // ada (g.failed) tapi tidak menggagalkan resolve — pemanggilan
     // function pointer null di sini akan SIGSEGV.
-    if (g.config.zoomFar && g.zoomScaleMax && g.field_static_get_value &&
+    if (cfg.zoomFar && g.zoomScaleMax && g.field_static_get_value &&
         g.field_static_set_value) {
         if (!g.zoomScaleMaxSaved) {
             float orig = 0;
@@ -782,7 +864,7 @@ void apply_features(const Config& prev) {
         float v = 30.0f;
         g.field_static_set_value(g.zoomScaleMax, &v);
     }
-    if (prev.zoomFar && !g.config.zoomFar && g.zoomScaleMax && g.zoomScaleMaxSaved &&
+    if (prev.zoomFar && !cfg.zoomFar && g.zoomScaleMax && g.zoomScaleMaxSaved &&
         g.field_static_set_value) {
         float v = g.zoomScaleMaxOrig;
         g.field_static_set_value(g.zoomScaleMax, &v);
@@ -792,6 +874,12 @@ void apply_features(const Config& prev) {
 // ---------------------------------------------------------------- aimbot hook
 typedef Il2CppArray* (*ShootTestFn)(void* thiz, Ray* ray, int32_t layerMask, void* method);
 std::map<void*, ShootTestFn> g_origShootTest;
+
+// Orig hook pompa (LevelController.Update) — satu entry. Base Update
+// dipakai SEMUA subclass LevelController (Arena/Random/ShootingRange/
+// Halloween/Christmas — tak satu pun override Update, diverifikasi
+// dari dump REA), jadi satu hook mencakup semuanya.
+std::map<void*, LevelUpdateFn> g_origLevelUpdate;
 
 Il2CppArray* hook_ShootTest(void* thiz, Ray* ray, int32_t layerMask, void* method) {
     (void)thiz;
@@ -804,13 +892,18 @@ Il2CppArray* hook_ShootTest(void* thiz, Ray* ray, int32_t layerMask, void* metho
         return nullptr;
     }
     ShootTestFn orig = it->second;
-    bool wantAim = g.config.aimbot || (g.config.zoomAim && g_isZooming);
-    if (wantAim && g.mode == Mode::MISI && ray) {
-        CachedTarget t;
-        {
-            std::lock_guard<std::mutex> lock(g.targetMutex);
-            t = g.target;
-        }
+    // Snapshot di bawah lock — target/mode/config ditulis pompa
+    // (main thread) dan worker; hook sendiri jalan di main thread.
+    bool wantAim = false;
+    Mode mode = Mode::UNKNOWN;
+    CachedTarget t;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        wantAim = g.config.aimbot || (g.config.zoomAim && g_isZooming);
+        mode = g.mode;
+        t = g.target;
+    }
+    if (wantAim && mode == Mode::MISI && ray) {
         if (t.valid && (now_ms() - t.timestampMs) < 300) {
             Vector3 dir{t.headPos.x - t.camPos.x, t.headPos.y - t.camPos.y,
                         t.headPos.z - t.camPos.z};
@@ -835,11 +928,12 @@ void try_install_hook() {
     if (!wclass) return;
     Il2CppMethod* m = find_method(wclass, "ShootTest", 2);
     if (!m) {
-        if (!g.hookInstalled) {
-            if (std::find(g.failed.begin(), g.failed.end(), "method:ShootTest") == g.failed.end()) {
-                g.failed.push_back("method:ShootTest");
-            }
+        bool installed;
+        {
+            std::lock_guard<std::mutex> lock(g.stateMutex);
+            installed = g.hookInstalled;
         }
+        if (!installed) add_failed("method:ShootTest");
         return;
     }
     void* addr = reinterpret_cast<Il2CppMethodOpaque*>(m)->methodPointer;
@@ -850,10 +944,113 @@ void try_install_hook() {
                        reinterpret_cast<void**>(&orig));
     if (rc == 0 && orig) {
         g_origShootTest[addr] = orig;
-        g.hookInstalled = true;
+        {
+            std::lock_guard<std::mutex> lock(g.stateMutex);
+            g.hookInstalled = true;
+        }
         LOGI("ShootTest hooked at %p", addr);
     } else {
         LOGE("DobbyHook ShootTest failed rc=%d", rc);
+    }
+}
+
+// ---------------------------------------------------------------- pompa main-thread
+// v1.0.5 — SEMUA pemanggilan API Unity pindah ke sini.
+//
+// Titik hook: LevelController.Update (protected virtual, 0 argumen).
+// Terverifikasi dari dump REA (~/workspace/rea-sniper3d/):
+//   - body native ASLI di libil2cpp.so (RVA 0x36D6640: prolog STP
+//     standar + state machine LevelState) — BUKAN stub;
+//   - tak satu pun dari 5 subclass LevelController (Arena / Random /
+//     ShootingRangeChallenge / Halloween / Christmas) meng-override
+//     Update — jadi hook di base methodPointer mencakup semuanya;
+//   - Unity memanggil Update tiap frame di main thread selama level
+//     aktif — tepat saat mode MISI dibutuhkan.
+// Urutan di hook: original DULU (state game fresh), baru pompa.
+void pump_main_thread() {
+    if (!g.coreResolved) return;
+    long long t = now_ms();
+    g.lastPumpMs.store(t);
+    // Snapshot config yang dipublish worker.
+    Config cfg;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        cfg = g.config;
+    }
+    // Cek mode tiap 500 ms (FindObjectsOfType x3 — legal di sini).
+    if (t - g.lastPumpModeMs >= 500) {
+        update_mode();
+        g.lastPumpModeMs = t;
+    }
+    Mode mode;
+    {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        mode = g.mode;
+    }
+    if (mode == Mode::MISI) {
+        // Enumerasi + fitur tiap 100 ms (throttle — Update jalan 60x/dtk).
+        if (t - g.lastEnumerateMs >= 100) {
+            enumerate_and_target();
+            apply_features(cfg, g.prevPumpConfig);
+            g.lastEnumerateMs = t;
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(g.stateMutex);
+        g.target.valid = false;
+    }
+    // Pasang/refresh hook ShootTest tiap 2 dtk (ganti senjata → subclass
+    // lain → hook dipasang ulang). Dulu di worker — pindah ke sini
+    // karena try_install_hook memanggil FindObjectsOfType.
+    if (t - g.lastPumpHookMs >= 2000) {
+        try_install_hook();
+        g.lastPumpHookMs = t;
+    }
+    g.prevPumpConfig = cfg;
+}
+
+void hook_LevelUpdate(void* thiz, void* method) {
+    LevelUpdateFn orig = nullptr;
+    void* mp = method ? reinterpret_cast<Il2CppMethodOpaque*>(method)->methodPointer : nullptr;
+    if (mp) {
+        auto it = g_origLevelUpdate.find(mp);
+        if (it != g_origLevelUpdate.end()) orig = it->second;
+    } else if (g_origLevelUpdate.size() == 1) {
+        orig = g_origLevelUpdate.begin()->second;
+    }
+    if (orig) orig(thiz, method);  // original dulu
+    // Bila orig tak dikenal, satu frame Update terlewat (aman) — pompa
+    // tetap jalan, ia tidak bergantung pada orig.
+    pump_main_thread();
+}
+
+void try_install_pump_hook() {
+    if (g.pumpHookInstalled) return;
+    if (!g.levelClass) return;
+    Il2CppMethod* m = find_method(g.levelClass, "Update", 0);
+    if (!m) {
+        add_failed("method:LevelUpdate");
+        return;
+    }
+    void* addr = reinterpret_cast<Il2CppMethodOpaque*>(m)->methodPointer;
+    if (!addr) return;
+    if (g_origLevelUpdate.count(addr)) return;  // sudah ter-hook
+    // Guard stub (pelajaran Dobby — jangan hook fungsi ≤8 byte):
+    // Update yang asli punya prolog STP; bila instruksi pertama RET
+    // (0xD65F03C0) atau B . (0x14000000), lewati — jangan rusak game.
+    uint32_t first = *reinterpret_cast<volatile uint32_t*>(addr);
+    if (first == 0xD65F03C0u || first == 0x14000000u) {
+        add_failed("method:LevelUpdate-stub");
+        return;
+    }
+    LevelUpdateFn orig = nullptr;
+    int rc = DobbyHook(addr, reinterpret_cast<void*>(&hook_LevelUpdate),
+                       reinterpret_cast<void**>(&orig));
+    if (rc == 0 && orig) {
+        g_origLevelUpdate[addr] = orig;
+        g.pumpHookInstalled = true;
+        LOGI("LevelController.Update hooked at %p", addr);
+    } else {
+        LOGE("DobbyHook LevelController.Update failed rc=%d", rc);
     }
 }
 
@@ -879,35 +1076,28 @@ void* worker_main(void*) {
          g.failed.empty() ? "READY" : "PARTIAL", g.failed.size());
     read_config();
 
-    Config prev = g.config;
+    // v1.0.5: worker thread TIDAK LAGI memanggil API Unity apa pun.
+    // Yang tersisa di sini: baca file config + tulis file status/ESP
+    // (I/O file biasa, aman dari thread mana pun) + pasang hook pompa
+    // (hanya resolve metadata + DobbyHook, tanpa API Unity).
+    // SEMUA FindObjectsOfType / get_position / WorldToScreenPoint /
+    // invoke / field-get-set jalan di pompa main-thread.
     while (true) {
         long long t = now_ms();
         if (t - g.lastConfigReadMs >= 500) {
             read_config();
             g.lastConfigReadMs = t;
         }
-        if (t - g.lastModeCheckMs >= 500) {
-            update_mode();
-            g.lastModeCheckMs = t;
-        }
         if (t - g.lastHookCheckMs >= 2000) {
-            try_install_hook();
+            try_install_pump_hook();
             g.lastHookCheckMs = t;
         }
-        if (g.mode == Mode::MISI) {
-            enumerate_and_target();
-            apply_features(prev);
-        } else {
-            std::lock_guard<std::mutex> lock(g.targetMutex);
-            g.target.valid = false;
-        }
-        prev = g.config;
         if (t - g.lastEspWriteMs >= 150) {
             write_esp();
             g.lastEspWriteMs = t;
         }
         if (t - g.lastStatusWriteMs >= 2000) {
-            write_status(g.failed.empty() ? "READY" : "PARTIAL");
+            write_status(failed_empty() ? "READY" : "PARTIAL");
             g.lastStatusWriteMs = t;
         }
         usleep(100 * 1000);

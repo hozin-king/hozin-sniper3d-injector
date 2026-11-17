@@ -335,11 +335,22 @@ object InjectorBridge {
      * Salin payload ke lokasi yang BISA di-dlopen proses game.
      * Utama: cache game sendiri (chown ke UID game + samakan konteks
      * SELinux + chmod 755). Cadangan: /data/local/tmp.
+     *
+     * v1.0.5: exit 0 dari rantai copy di atas BELUM membuktikan file
+     * ada — tes POCO v1.0.4: staging "sukses" tapi dlopen percobaan 1
+     * bilang "not found". Karena itu file DIVERIFIKASI terpisah
+     * (test -f + ls -lZ, supaya konteks SELinux-nya ikut tercatat)
+     * dan hasilnya masuk diagnosis. Bila verifikasi gagal, kembalikan
+     * null — inject() lalu memakai path lib injector sebagai
+     * percobaan PERTAMA, bukan membuang satu percobaan untuk path
+     * yang tidak ada.
+     * @return Pair(path yang terverifikasi atau null, log staging)
      */
-    private fun stagePayload(context: Context): String? {
+    private fun stagePayload(context: Context): Pair<String?, String> {
         // Sumber payload: lib dir bila ada, bila tidak ekstrak dari APK
         // (jaring pengaman yang sama seperti injector — v1.0).
-        val src = resolveNativeLib(context, PAYLOAD_LIB) ?: return null
+        val src = resolveNativeLib(context, PAYLOAD_LIB)
+            ?: return null to "staging gagal: libpayload.so tidak ditemukan di aplikasi"
         val gameStage = RootUtil.su(
             "D='$GAME_CACHE_DIR'; " +
             "mkdir -p \"\$D\" && cp '$src' '$PAYLOAD_GAME' && " +
@@ -349,9 +360,16 @@ object InjectorBridge {
             "chcon --reference=\"\$D\" '$PAYLOAD_GAME' 2>/dev/null; " +
             "ls -l '$PAYLOAD_GAME'"
         )
-        if (gameStage.exitCode == 0) return PAYLOAD_GAME
+        val verify = RootUtil.su(
+            "ls -lZ '$PAYLOAD_GAME' 2>&1; " +
+            "test -f '$PAYLOAD_GAME' && echo STAGE_OK || echo STAGE_MISSING"
+        )
+        val stageLog = "staging cache game:\n${gameStage.output.trim()}\n" +
+            "verifikasi:\n${verify.output.trim()}"
+        if (verify.output.contains("STAGE_OK")) return PAYLOAD_GAME to stageLog
         val r = RootUtil.su("cp '$src' '$PAYLOAD_TMP' && chmod 755 '$PAYLOAD_TMP'")
-        return if (r.exitCode == 0) PAYLOAD_TMP else null
+        return if (r.exitCode == 0) PAYLOAD_TMP to (stageLog + "\nfallback /data/local/tmp: OK")
+        else null to (stageLog + "\nfallback /data/local/tmp: GAGAL")
     }
 
     /** Ambil nilai string untuk key pada JSON sederhana {"k":"v",...}
@@ -424,12 +442,12 @@ object InjectorBridge {
                 "payload sudah ter-load di pid $pid — lewati dlopen, langsung tunggu status"
             )
         }
-        val staged = stagePayload(context)
+        val (staged, stageLog) = stagePayload(context)
         val nativePayload = resolveNativeLib(context, PAYLOAD_LIB) ?: payloadPath(context)
         val primary = staged ?: nativePayload
         val attempts = arrayOf(primary, nativePayload, primary)
         var last: InjectResult? = null
-        val allDiag = StringBuilder("injector: $injector (kerangka TR v1.0.4)")
+        val allDiag = StringBuilder("injector: $injector (kerangka TR v1.0.5)\n$stageLog")
         // Hapus hasil inject lama supaya percobaan ini tidak membaca
         // JSON basi (pola TR).
         RootUtil.su("rm -f '$INJECT_RESULT'")
