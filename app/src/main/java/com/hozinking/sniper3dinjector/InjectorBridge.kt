@@ -1,7 +1,6 @@
 package com.hozinking.sniper3dinjector
 
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import java.io.File
 import java.util.zip.ZipFile
@@ -15,6 +14,14 @@ import java.util.zip.ZipFile
  * milik game) karena /data/local/tmp sering tak bisa dibaca proses game
  * (SELinux) — dlopen dari sana NULL. Injector menangkap dlerror() dan
  * mencoba jalur cadangan.
+ *
+ * v1.0.2: SELURUH alur root + launch ditulis ulang mengikuti kerangka
+ * Traffic Rider (ModInjector.java + RootUtil.java, teruji di POCO user):
+ * tiap perintah root lewat `su -c` baru dengan timeout keras (RootUtil),
+ * game diluncurkan DULUAN sebelum semua tunggu yang lama, dan dibawa
+ * ke depan HANYA bila inject sukses. RootShell persisten v1.0–v1.0.1
+ * DIHAPUS (tanpa timeout — alur bisa membeku selamanya, bukti tes
+ * v1.0.1: log berhenti di "root: available").
  *
  * Gate versi: aplikasi TIDAK menolak berdasarkan versionCode. Gate ada
  * di payload — semua class/method IL2CPP harus ter-resolve berdasarkan
@@ -94,7 +101,7 @@ object InjectorBridge {
             apk.getInputStream(entry).use { inp ->
                 dest.outputStream().use { out -> inp.copyTo(out) }
             }
-            RootShell.exec("chmod 755 '${dest.absolutePath}'")
+            RootUtil.su("chmod 755 '${dest.absolutePath}'")
             if (dest.exists() && dest.length() > 0) dest.absolutePath else null
         } catch (e: Exception) {
             null
@@ -145,7 +152,7 @@ object InjectorBridge {
 
     /** Baca file status payload (dua lokasi, via root). "" bila tak ada. */
     fun readPayloadStatus(): String {
-        val r = RootShell.exec(
+        val r = RootUtil.su(
             "cat '$PAYLOAD_STATUS_TMP' 2>/dev/null || cat '$PAYLOAD_STATUS_CACHE' 2>/dev/null"
         )
         return r.output.trim()
@@ -153,7 +160,7 @@ object InjectorBridge {
 
     /** Baca ctor log payload. "" bila tak ada. */
     fun readCtorLog(): String {
-        val r = RootShell.exec("cat '$CTOR_LOG_CACHE' 2>/dev/null")
+        val r = RootUtil.su("cat '$CTOR_LOG_CACHE' 2>/dev/null")
         return r.output.trim()
     }
 
@@ -194,87 +201,126 @@ object InjectorBridge {
         else -> "gagal tak dikenal (exit=$exitCode)"
     }
 
-    /** pidof dulu; bila kosong, scan /proc/<pid>/cmdline via su. */
+    /** pidof saja (pola TR — tanpa scan /proc fallback: scan itu
+     *  memakan waktu beberapa detik dan menahan SELURUH alur sebelum
+     *  game sempat diluncurkan; bukti tes v1.0.1). */
     fun findPid(processName: String): Int? {
-        val r = RootShell.exec("pidof $processName")
-        val pid = r.output.trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull()
-        if (r.exitCode == 0 && pid != null) return pid
-        val safe = processName.replace(".", "[.]")
-        val scan = "for p in /proc/[0-9]*/cmdline; do " +
-            "if grep -a -q '^$safe' \"\$p\" 2>/dev/null; then " +
-            "echo \"\$p\" | cut -d/ -f3; fi; done"
-        val r2 = RootShell.exec(scan)
-        return r2.output.trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull()
+        val pid = RootUtil.pidOf(processName)
+        return if (pid > 0) pid else null
     }
 
     /** Apakah lib sudah termuat di proses game (poll /proc/<pid>/maps). */
     fun isLibLoaded(pid: Int, libName: String): Boolean {
-        val r = RootShell.exec("grep -q '$libName' /proc/$pid/maps")
-        return r.exitCode == 0
+        return RootUtil.mapsContains(pid, libName)
     }
 
     /** Anti-double-load: true bila payload sudah ter-map di proses game. */
     fun isPayloadLoaded(pid: Int): Boolean = isLibLoaded(pid, "payload\\.so")
 
-    /** Luncurkan game via root (pola Traffic Rider): resolve launcher
-     *  activity lalu `am start -n`; fallback intent aplikasi, lalu
-     *  monkey. `am start` via root membawa game ke foreground — intent
-     *  aplikasi saja terbukti tidak selalu memindahkan user ke game. */
-    fun launchGame(context: Context): Boolean {
+    /** Tunggu game SIAP sebelum ptrace attach (pola TR verbatim):
+     *  libil2cpp.so ter-map (maks 20 dtk) + jeda settle 3 dtk biar main
+     *  thread keluar dari rantai dlopen Unity. Tanpa ini remote-dlopen
+     *  bisa mendarat saat main thread masih memegang linker lock ->
+     *  dlopen bersarang deadlock (pelajaran TR v2.0/v2.1).
+     *  Bila lib belum ter-map setelah 20 dtk, LANJUT — payload menunggu
+     *  sendiri; hanya PID mati/berubah yang membatalkan.
+     *  @return false bila PID mati/berubah selama menunggu. */
+    fun waitForGameReady(pid: Int, log: (String) -> Unit): Boolean {
+        log("Tunggu libil2cpp.so dimuat (maks 20 dtk)...")
+        var mapped = false
+        for (i in 0 until 20) {
+            if (RootUtil.mapsContains(pid, TARGET_LIB)) {
+                mapped = true
+                break
+            }
+            if (!RootUtil.pidAlive(pid)) {
+                log("PID game mati saat menunggu lib — batal.")
+                return false
+            }
+            Thread.sleep(1000)
+        }
+        if (!mapped) {
+            log("libil2cpp.so belum ter-map setelah 20 dtk — lanjut, payload akan menunggu sendiri.")
+        } else {
+            log("libil2cpp.so ter-map — jeda 3 dtk biar Unity selesai load...")
+            try {
+                Thread.sleep(3000)
+            } catch (_: InterruptedException) {
+            }
+            if (!RootUtil.pidAlive(pid)) {
+                log("PID game mati saat jeda — batal.")
+                return false
+            }
+        }
+        return true
+    }
+
+    /** Buka game via root (pola Traffic Rider verbatim): resolve launcher
+     *  activity lalu `am start -n`; fallback `monkey` bila resolve gagal.
+     *  Poll pidOf maks 20 detik — return true HANYA bila PID game
+     *  benar-benar muncul (v1.0.1 return true langsung setelah `am
+     *  start` tanpa verifikasi, jadi kegagalan launch tak ketahuan).
+     *  Tanpa fallback intent aplikasi: startActivity dari thread
+     *  background bisa diblokir pembatasan background-activity-launch
+     *  di Android 16, sementara `am start` via root selalu lolos. */
+    fun launchGame(log: (String) -> Unit): Boolean {
         val safe = TARGET_PACKAGE.replace(Regex("[^a-zA-Z0-9_.]"), "")
-        val resolve = RootShell.exec(
+        if (safe.isEmpty()) return false
+        val resolve = RootUtil.su(
             "cmd package resolve-activity --brief -a android.intent.action.MAIN " +
                 "-c android.intent.category.LAUNCHER $safe | tail -1"
         )
         val comp = resolve.output.trim()
         if (resolve.exitCode == 0 && comp.contains("/")) {
-            RootShell.exec("am start -n $comp")
-            return true
+            log("Buka game: $comp")
+            RootUtil.su("am start -n $comp")
+        } else {
+            log("Resolve activity gagal — pakai monkey.")
+            RootUtil.su("monkey -p $safe -c android.intent.category.LAUNCHER 1")
         }
-        try {
-            val intent = context.packageManager.getLaunchIntentForPackage(TARGET_PACKAGE)
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
+        for (i in 0 until 20) {
+            val pid = RootUtil.pidOf(safe)
+            if (pid > 0) {
+                log("Game jalan (pid $pid).")
                 return true
             }
-        } catch (e: Exception) {
-            // jatuh ke monkey di bawah
+            Thread.sleep(1000)
         }
-        val r = RootShell.exec(
-            "monkey -p $TARGET_PACKAGE -c android.intent.category.LAUNCHER 1"
-        )
-        return r.exitCode == 0
+        return false
     }
 
-    /** Bawa game ke depan tanpa inject (pola Traffic Rider — dipakai
-     *  setelah inject selesai supaya user langsung mendarat di game
-     *  dengan overlay tampil, bukan menatap layar log). */
+    /** Bawa game ke depan (tanpa inject) — pola Traffic Rider verbatim:
+     *  resolve launcher activity lalu `am start -n`. Dipakai alur
+     *  LUNCURKAN setelah inject sukses agar user langsung mendarat di
+     *  game dengan overlay tampil. */
     fun bringGameToFront() {
         val safe = TARGET_PACKAGE.replace(Regex("[^a-zA-Z0-9_.]"), "")
-        val resolve = RootShell.exec(
+        if (safe.isEmpty()) return
+        val resolve = RootUtil.su(
             "cmd package resolve-activity --brief -a android.intent.action.MAIN " +
                 "-c android.intent.category.LAUNCHER $safe | tail -1"
         )
         val comp = resolve.output.trim()
         if (resolve.exitCode == 0 && comp.contains("/")) {
-            RootShell.exec("am start -n $comp")
+            RootUtil.su("am start -n $comp")
         }
     }
 
-    /** Tulis config toggle ke cache game via root (dibaca payload tiap 500 ms). */
+    /** Tulis config toggle ke cache game via root (dibaca payload tiap 500 ms).
+     *  Pola TR (printf, bukan heredoc): satu perintah `su -c`, tanpa
+     *  baris-baris heredoc yang harus lolos lewat shell persisten. */
     fun writeConfig(configJson: String): Boolean {
-        val r = RootShell.exec(
+        val esc = configJson.replace("'", "'\"'\"'")
+        val r = RootUtil.su(
             "D='$GAME_CACHE_DIR'; mkdir -p \"\$D\" && " +
-            "cat > '$CONFIG_PATH' <<'HOZINCFG'\n$configJson\nHOZINCFG\n" +
-            "chmod 644 '$CONFIG_PATH'"
+                "printf '%s' '$esc' > '$CONFIG_PATH' && chmod 644 '$CONFIG_PATH'"
         )
         return r.exitCode == 0
     }
 
     /** Baca data ESP (JSON) dari cache game via root. "" bila tak ada. */
     fun readEspJson(): String {
-        val r = RootShell.exec("cat '$ESP_PATH' 2>/dev/null")
+        val r = RootUtil.su("cat '$ESP_PATH' 2>/dev/null")
         return r.output.trim()
     }
 
@@ -287,7 +333,7 @@ object InjectorBridge {
         // Sumber payload: lib dir bila ada, bila tidak ekstrak dari APK
         // (jaring pengaman yang sama seperti injector — v1.0).
         val src = resolveNativeLib(context, PAYLOAD_LIB) ?: return null
-        val gameStage = RootShell.exec(
+        val gameStage = RootUtil.su(
             "D='$GAME_CACHE_DIR'; " +
             "mkdir -p \"\$D\" && cp '$src' '$PAYLOAD_GAME' && " +
             "U=\$(stat -c %u '$GAME_DATA_DIR' 2>/dev/null); " +
@@ -297,7 +343,7 @@ object InjectorBridge {
             "ls -l '$PAYLOAD_GAME'"
         )
         if (gameStage.exitCode == 0) return PAYLOAD_GAME
-        val r = RootShell.exec("cp '$src' '$PAYLOAD_TMP' && chmod 755 '$PAYLOAD_TMP'")
+        val r = RootUtil.su("cp '$src' '$PAYLOAD_TMP' && chmod 755 '$PAYLOAD_TMP'")
         return if (r.exitCode == 0) PAYLOAD_TMP else null
     }
 
@@ -313,7 +359,7 @@ object InjectorBridge {
         // kembalikan 127 dengan diagnosis yang menyebut path persisnya.
         val injector = resolveNativeLib(context, INJECTOR_LIB)
         if (injector == null) {
-            val ls = RootShell.exec(
+            val ls = RootUtil.su(
                 "ls -l '${context.applicationInfo.nativeLibraryDir}' 2>&1"
             ).output.trim()
             return InjectResult(
@@ -323,7 +369,7 @@ object InjectorBridge {
                     "Uninstall aplikasi ini lalu install ulang APK v1.0.1."
             )
         }
-        RootShell.exec("chmod 755 '$injector'")
+        RootUtil.su("chmod 755 '$injector'")
         if (isPayloadLoaded(pid)) {
             return InjectResult(
                 0, "",
@@ -346,10 +392,10 @@ object InjectorBridge {
                     return InjectResult(0, "", full)
                 }
             }
-            val r = RootShell.exec("'$injector' $pid $path")
+            val r = RootUtil.su("'$injector' $pid $path")
             var diag = r.output.trim()
             if (diag.isEmpty()) {
-                val log = RootShell.exec("cat '$INJECT_LOG' 2>/dev/null")
+                val log = RootUtil.su("cat '$INJECT_LOG' 2>/dev/null")
                 diag = log.output.trim()
             }
             val ctor = readCtorLog()

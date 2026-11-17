@@ -1,4 +1,4 @@
-# Hozin Sniper 3D Injector v1.0.1
+# Hozin Sniper 3D Injector v1.0.2
 
 Root injector (Kotlin + payload native) untuk **Sniper 3D** (`com.fungames.sniper3d`)
 **v7.15.0 / code 33186**, Unity 6000.3.21f1 (Unity 6) IL2CPP. Game **tidak dibundel**
@@ -62,6 +62,14 @@ misi, damage multiplier, bypass Play Integrity, pemalsuan laporan progres
 - **Tanpa jaminan anti-ban.** Server punya Play Integrity + tag cheater
   (`CheaterDetected`, `PlayerIsTaggedAsCheater`) → ban/suspend permanen.
   Pakai akun utama dengan risiko sendiri.
+- **v1.0.2 menulis ulang alur root + launch mengikuti kerangka Traffic
+  Rider** (`ModInjector.java` + `RootUtil.java`, teruji di POCO user):
+  tiap perintah root lewat `su -c` baru dengan timeout keras, game
+  diluncurkan DULUAN sebelum semua tunggu yang lama, dan dibawa ke
+  depan hanya bila inject sukses. v1.0.1 gagal auto-launch di perangkat
+  (log berhenti di "root: available", game tak pernah dibawa ke depan):
+  shell `su` persisten TANPA timeout + scan /proc yang lambat menahan
+  alur sebelum game sempat diluncurkan. `RootShell.kt` DIHAPUS.
 - **v1.0.1 memperbaiki kegagalan total v1.0 di perangkat** (inject exit=127):
   manifest v1.0 tidak menyetel `extractNativeLibs` → `.so` tidak diekstrak
   ke lib dir → shell melaporkan "command not found". v1.0.1 menyetel
@@ -74,14 +82,14 @@ misi, damage multiplier, bypass Play Integrity, pemalsuan laporan progres
 ## Build
 
 APK **hanya** di GitHub Actions: push ke `main` → build → tag + rilis otomatis
-(`HozinSniper3DInjector-v1.0.1.apk`).
+(`HozinSniper3DInjector-v1.0.2.apk`).
 
 ## Struktur
 
 ```
 app/src/main/java/com/hozinking/sniper3dinjector/
   MainActivity.kt      # alur inject otomatis + diagnosis
-  RootShell.kt         # shell su persisten
+  RootUtil.kt          # root ala Traffic Rider: `su -c` baru + timeout
   InjectorBridge.kt    # staging, inject, status, config, ESP (via root)
   FloatingService.kt   # tombol 🎯 + menu 6 toggle + polling ESP
   EspView.kt           # kanvas ESP (kotak, bar HP, teks, crosshair)

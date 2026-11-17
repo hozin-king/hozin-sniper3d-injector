@@ -9,15 +9,25 @@ import androidx.appcompat.app.AppCompatActivity
 import com.hozinking.sniper3dinjector.databinding.ActivityMainBinding
 
 /**
- * Hozin Sniper 3D Injector v1.0.1 — launcher root untuk Sniper 3D
+ * Hozin Sniper 3D Injector v1.0.2 — launcher root untuk Sniper 3D
  * (com.fungames.sniper3d) v7.15.0, Unity 6 IL2CPP. Game TIDAK dibundel —
  * user install sendiri dari Play Store.
  *
- * ALUR (otomatis penuh): Tap "Inject ke Sniper 3D" → cek root → cek
- * install/versi → bila game belum jalan, OTOMATIS launch game → tunggu
- * PID → tunggu libil2cpp.so termuat → jeda settle 3 dtk (jangan dlopen
- * saat main thread masih memegang loader lock — pelajaran TR v2.0/v2.1)
- * → inject otomatis (retry 3x) → tunggu status payload 15 dtk.
+ * ALUR (kerangka Traffic Rider, ModInjector.java + RootUtil.java —
+ * teruji di POCO user): Tap "Inject ke Sniper 3D" → cek root → cek
+ * install/versi (PackageManager saja, cepat, tanpa root) → bila game
+ * belum jalan, OTOMATIS launch game DULUAN (sebelum semua tunggu yang
+ * lama — user mendarat di game dalam ~2 detik) → tunggu game siap
+ * (libil2cpp ter-map maks 20 dtk + jeda settle 3 dtk) → inject otomatis
+ * (retry 3x) → tunggu status payload 15 dtk → bila sukses, bawa user
+ * ke game (bringGameToFront ala TR). Bila gagal, tetap di aplikasi
+ * supaya diagnosis bisa disalin.
+ *
+ * v1.0.1 gagal di POCO (log berhenti di "root: available", game tak
+ * pernah dibawa ke depan): shell `su` persisten tanpa timeout +
+ * scan /proc yang lambat menahan alur SEBELUM game sempat diluncurkan.
+ * v1.0.2: tiap perintah root lewat `su -c` baru + timeout keras
+ * (RootUtil), tanpa scan /proc, launch diverifikasi lewat PID.
  * Tombol mengambang (FloatingService) muncul begitu proses dimulai dan
  * tetap tampil apa pun hasilnya — anti gagal.
  *
@@ -50,7 +60,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnCheckRoot.setOnClickListener {
             Thread {
-                val available = RootShell.isRootAvailable()
+                val available = RootUtil.isRooted()
                 log(if (available) "root: available" else "root: NOT available — butuh HP root")
             }.start()
         }
@@ -77,64 +87,59 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Seluruh alur inject otomatis, dengan progres ke log. */
+    /** Seluruh alur inject otomatis, dengan progres ke log.
+     *  Urutan = kerangka Traffic Rider (ModInjector.inject):
+     *  root → info game → launch game DULUAN bila belum jalan →
+     *  tunggu game siap → inject → status → bawa ke game bila sukses. */
     private fun runAutoInject() {
         autoRunning = true
         try {
-            log("== Inject v1.0.1 — alur otomatis ==")
+            log("== Inject v1.0.2 — alur otomatis ==")
             // Tombol mengambang muncul duluan — anti gagal.
             FloatingService.start(this)
 
             // 1. Root.
-            if (!RootShell.isRootAvailable()) {
+            if (!RootUtil.isRooted()) {
                 log("root: NOT available — butuh HP root")
                 return
             }
             log("root: available")
 
-            // 2. Install / versi (cross-check PID — jangan pernah bilang
-            // "TIDAK terinstall" saat game jalan).
-            val check = InjectorBridge.checkGame(this)
-            log(check)
+            // 2. Install / versi — PackageManager saja (cepat, tanpa
+            //    root; v1.0.1 menaruh findPid + scan /proc di sini dan
+            //    menahan alur sebelum game sempat diluncurkan).
             val version = InjectorBridge.installedVersionCode(this)
             val versionName = InjectorBridge.installedVersionName(this)
-            if (version != null) {
-                log("versi terinstall: ${versionName ?: "?"} (code $version) — ditampilkan apa adanya")
-            }
-            if (version == null && InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE) == null) {
-                log("Sniper 3D belum terinstall")
+            if (version == null) {
+                log("Sniper 3D belum terinstall — install com.fungames.sniper3d dari Play Store dulu")
                 return
             }
+            log("Sniper 3D terinstall: ${versionName ?: "?"} (code $version) — target v7.15.0 (code 33186); " +
+                "bila versi berbeda, payload yang memutuskan (resolve berdasarkan nama)")
 
-            // 3. Game belum jalan → luncurkan otomatis.
+            // 3. Game belum jalan → luncurkan otomatis DULUAN (TR:
+            //    game dibuka dalam ~2 detik setelah tap Inject,
+            //    SEBELUM semua tunggu yang lama).
             var pid = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
             if (pid == null) {
                 log("Sniper 3D belum jalan — meluncurkan otomatis…")
-                if (!InjectorBridge.launchGame(this)) {
+                if (!InjectorBridge.launchGame { log(it) }) {
                     log("launch game GAGAL — buka Sniper 3D manual lalu tap Inject lagi")
                     return
                 }
-                pid = waitForPid(30)
+                pid = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
                 if (pid == null) {
-                    log("game tidak muncul (PID tak ketemu setelah 30 dtk)")
+                    log("game tidak muncul (PID tak ketemu setelah launch)")
                     return
                 }
             }
             log("pid Sniper 3D: $pid")
 
-            // 4. Tunggu libil2cpp.so termuat (maks 45 dtk).
-            val libOk = waitForLib(pid, 45)
-            if (libOk) {
-                log("libil2cpp.so termuat")
-                log("jeda settle 3 dtk biar game selesai load…")
-                Thread.sleep(3000)
-                val pidAlive = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
-                if (pidAlive != pid) {
-                    log("PID game berubah/mati saat jeda settle — batal")
-                    return
-                }
-            } else {
-                log("libil2cpp.so belum terlihat setelah 45 dtk — inject tetap dicoba (payload menunggu sendiri)")
+            // 4. Tunggu game SIAP (TR waitForGameReady — libil2cpp
+            //    ter-map maks 20 dtk + jeda settle 3 dtk).
+            if (!InjectorBridge.waitForGameReady(pid) { log(it) }) {
+                log("PID game mati/berubah saat menunggu Unity siap — batal")
+                return
             }
 
             // 5. Inject + diagnosis.
@@ -146,6 +151,7 @@ class MainActivity : AppCompatActivity() {
                 if (pidAfter != null) "game masih jalan setelah inject (pid $pidAfter)"
                 else "game MATI setelah inject — kemungkinan crash saat remote call"
             )
+            var injectedOk = false
             if (result.exitCode == 0) {
                 val ps = waitForPayloadStatus(15)
                 val rawStatus = InjectorBridge.readPayloadStatus()
@@ -160,10 +166,12 @@ class MainActivity : AppCompatActivity() {
                 )
                 when {
                     ps.status == "READY" -> {
+                        injectedOk = true
                         log("payload READY — semua class/method IL2CPP ketemu (lib ${ps.libSize} B, hook ${ps.hook})")
                         log("inject OK — kembali ke game, tap tombol 🎯 untuk menu mod (mode MISI saja)")
                     }
                     ps.status.startsWith("PARTIAL") -> {
+                        injectedOk = true
                         log("payload PARTIAL (${ps.status}) — sebagian resolve gagal: ${ps.failed} — " +
                             "game tetap jalan, fitur yang gagal nonaktif (bukan toggle palsu)")
                     }
@@ -184,28 +192,18 @@ class MainActivity : AppCompatActivity() {
             } else {
                 log("inject GAGAL — ${InjectorBridge.failureReason(result.exitCode)}")
             }
-            // Bawa user ke game (pola Traffic Rider) — jangan biarkan user
-            // menatap layar log sementara game jalan di belakang.
-            // Hanya bila game masih hidup; bila game mati, tetap di sini
-            // supaya diagnosis bisa disalin.
-            if (pidAfter != null) {
+            // Bawa user ke game HANYA bila inject sukses (pola Traffic
+            // Rider: bringGameToFront di thread baru setelah status OK,
+            // tanpa moveTaskToBack — `am start -n` via root yang
+            // memindahkan user). Bila gagal, tetap di sini supaya
+            // diagnosis bisa disalin.
+            if (injectedOk && pidAfter != null) {
                 log("kembali ke game…")
-                InjectorBridge.bringGameToFront()
-                runOnUiThread { moveTaskToBack(true) }
+                Thread { InjectorBridge.bringGameToFront() }.start()
             }
         } finally {
             autoRunning = false
         }
-    }
-
-    /** Poll PID sampai timeout detik; null bila tak muncul. */
-    private fun waitForPid(timeoutSec: Int): Int? {
-        repeat(timeoutSec * 2) {
-            val pid = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
-            if (pid != null) return pid
-            Thread.sleep(500)
-        }
-        return null
     }
 
     /** Poll file status payload sampai timeout detik; status "" bila tak muncul. */
@@ -217,17 +215,6 @@ class MainActivity : AppCompatActivity() {
             Thread.sleep(500)
         }
         return InjectorBridge.PayloadStatus("", "-", "-", "-", "-", "")
-    }
-
-    /** Poll libil2cpp.so di /proc/<pid>/maps sampai timeout detik. */
-    private fun waitForLib(pid: Int, timeoutSec: Int): Boolean {
-        var waited = 0
-        while (waited < timeoutSec) {
-            if (InjectorBridge.isLibLoaded(pid, InjectorBridge.TARGET_LIB)) return true
-            Thread.sleep(1000)
-            waited++
-        }
-        return InjectorBridge.isLibLoaded(pid, InjectorBridge.TARGET_LIB)
     }
 
     private fun log(line: String) {

@@ -178,7 +178,7 @@ class FloatingService : Service() {
             setPadding(24, 20, 24, 20)
         }
         val title = TextView(this).apply {
-            text = "Hozin Sniper 3D v1.0"
+            text = "Hozin Sniper 3D v1.0.2"
             textSize = 17f
             setTextColor(0xFFFFFFFF.toInt())
         }
