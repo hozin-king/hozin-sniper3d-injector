@@ -9,7 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.hozinking.sniper3dinjector.databinding.ActivityMainBinding
 
 /**
- * Hozin Sniper 3D Injector v1.0 — launcher root untuk Sniper 3D
+ * Hozin Sniper 3D Injector v1.0.1 — launcher root untuk Sniper 3D
  * (com.fungames.sniper3d) v7.15.0, Unity 6 IL2CPP. Game TIDAK dibundel —
  * user install sendiri dari Play Store.
  *
@@ -81,7 +81,7 @@ class MainActivity : AppCompatActivity() {
     private fun runAutoInject() {
         autoRunning = true
         try {
-            log("== Inject v1.0 — alur otomatis ==")
+            log("== Inject v1.0.1 — alur otomatis ==")
             // Tombol mengambang muncul duluan — anti gagal.
             FloatingService.start(this)
 
@@ -183,6 +183,15 @@ class MainActivity : AppCompatActivity() {
                 }
             } else {
                 log("inject GAGAL — ${InjectorBridge.failureReason(result.exitCode)}")
+            }
+            // Bawa user ke game (pola Traffic Rider) — jangan biarkan user
+            // menatap layar log sementara game jalan di belakang.
+            // Hanya bila game masih hidup; bila game mati, tetap di sini
+            // supaya diagnosis bisa disalin.
+            if (pidAfter != null) {
+                log("kembali ke game…")
+                InjectorBridge.bringGameToFront()
+                runOnUiThread { moveTaskToBack(true) }
             }
         } finally {
             autoRunning = false

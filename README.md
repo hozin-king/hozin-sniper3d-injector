@@ -1,4 +1,4 @@
-# Hozin Sniper 3D Injector v1.0
+# Hozin Sniper 3D Injector v1.0.1
 
 Root injector (Kotlin + payload native) untuk **Sniper 3D** (`com.fungames.sniper3d`)
 **v7.15.0 / code 33186**, Unity 6000.3.21f1 (Unity 6) IL2CPP. Game **tidak dibundel**
@@ -62,15 +62,19 @@ misi, damage multiplier, bypass Play Integrity, pemalsuan laporan progres
 - **Tanpa jaminan anti-ban.** Server punya Play Integrity + tag cheater
   (`CheaterDetected`, `PlayerIsTaggedAsCheater`) → ban/suspend permanen.
   Pakai akun utama dengan risiko sendiri.
-- **v1.0 belum teruji di perangkat.** Hook `ShootTest` adalah bagian
-  paling berisiko (ABI Ray 24-byte + virtual override). Bila hook gagal,
-  status payload menunjukkan `HOOK=gagal` dan aimbot nonaktif — fitur lain
-  tetap bisa jalan.
+- **v1.0.1 memperbaiki kegagalan total v1.0 di perangkat** (inject exit=127):
+  manifest v1.0 tidak menyetel `extractNativeLibs` → `.so` tidak diekstrak
+  ke lib dir → shell melaporkan "command not found". v1.0.1 menyetel
+  `extractNativeLibs=true` (pola HCR) + jaring pengaman ekstraksi dari APK
+  + auto-launch game ke foreground via `am start` (pola Traffic Rider).
+  Hook `ShootTest` tetap bagian paling berisiko (ABI Ray 24-byte + virtual
+  override). Bila hook gagal, status payload menunjukkan `HOOK=gagal` dan
+  aimbot nonaktif — fitur lain tetap bisa jalan.
 
 ## Build
 
 APK **hanya** di GitHub Actions: push ke `main` → build → tag + rilis otomatis
-(`HozinSniper3DInjector-v1.0.apk`).
+(`HozinSniper3DInjector-v1.0.1.apk`).
 
 ## Struktur
 

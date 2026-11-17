@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import java.io.File
+import java.util.zip.ZipFile
 
 /**
  * Jembatan Kotlin ↔ native injector (ptrace + remote dlopen) untuk
@@ -69,6 +70,36 @@ object InjectorBridge {
 
     fun payloadPath(context: Context): String =
         File(context.applicationInfo.nativeLibraryDir, PAYLOAD_LIB).absolutePath
+
+    /**
+     * Cari file .so native: utama nativeLibraryDir; bila tidak ada di
+     * sana, ekstrak dari APK sendiri (sourceDir) ke filesDir + chmod 755.
+     * Return path absolut, atau null bila keduanya gagal.
+     *
+     * Latar: v1.0 gagal total dengan exit=127 karena manifest TIDAK
+     * menyetel extractNativeLibs (AGP default false) → .so hanya
+     * tersimpan di APK dan TIDAK PERNAH diekstrak ke nativeLibraryDir,
+     * jadi shell su melaporkan "command not found". v1.0.1 menyetel
+     * extractNativeLibs=true di manifest (akar diperbaiki, pola HCR);
+     * fungsi ini adalah jaring pengaman bila file tetap tidak ada.
+     */
+    fun resolveNativeLib(context: Context, libName: String): String? {
+        val inLibDir = File(context.applicationInfo.nativeLibraryDir, libName)
+        if (inLibDir.exists()) return inLibDir.absolutePath
+        val dest = File(context.filesDir, libName)
+        if (dest.exists() && dest.length() > 0) return dest.absolutePath
+        return try {
+            val apk = ZipFile(context.applicationInfo.sourceDir)
+            val entry = apk.getEntry("lib/arm64-v8a/$libName") ?: return null
+            apk.getInputStream(entry).use { inp ->
+                dest.outputStream().use { out -> inp.copyTo(out) }
+            }
+            RootShell.exec("chmod 755 '${dest.absolutePath}'")
+            if (dest.exists() && dest.length() > 0) dest.absolutePath else null
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     /** Cek game terinstall + tampilkan versi apa adanya (tanpa penilaian). */
     fun checkGame(context: Context): String {
@@ -148,9 +179,19 @@ object InjectorBridge {
         return PayloadStatus(status, failed, libSize, mode, hook, raw)
     }
 
-    fun ensureExecutable(context: Context): Boolean {
-        val result = RootShell.exec("chmod 755 '${injectorPath(context)}'")
-        return result.exitCode == 0
+    /** Arti exit code injector dalam bahasa manusia. */
+    fun failureReason(exitCode: Int): String = when (exitCode) {
+        0 -> "OK"
+        2 -> "argumen injector salah (bug aplikasi)"
+        3 -> "libdl/libc tidak ketemu di proses injector sendiri"
+        4 -> "ptrace attach ditolak — root tidak aktif / SELinux menolak"
+        5 -> "libc/libdl tidak ketemu di proses game (layout maps aneh)"
+        6 -> "alokasi memori di proses game gagal"
+        7 -> "tulis path payload ke memori game gagal"
+        8 -> "panggilan dlopen di game tidak selesai (timeout; bila tetap gagal, salin diagnosis)"
+        9 -> "dlopen payload ditolak — baca baris dlerror di diagnosis (alasan linker yang sebenarnya)"
+        127 -> "injector tidak ditemukan / tidak bisa dieksekusi (command not found — baca baris 'injector:' di diagnosis)"
+        else -> "gagal tak dikenal (exit=$exitCode)"
     }
 
     /** pidof dulu; bila kosong, scan /proc/<pid>/cmdline via su. */
@@ -175,8 +216,21 @@ object InjectorBridge {
     /** Anti-double-load: true bila payload sudah ter-map di proses game. */
     fun isPayloadLoaded(pid: Int): Boolean = isLibLoaded(pid, "payload\\.so")
 
-    /** Luncurkan game (intent dulu, fallback monkey via su). */
+    /** Luncurkan game via root (pola Traffic Rider): resolve launcher
+     *  activity lalu `am start -n`; fallback intent aplikasi, lalu
+     *  monkey. `am start` via root membawa game ke foreground — intent
+     *  aplikasi saja terbukti tidak selalu memindahkan user ke game. */
     fun launchGame(context: Context): Boolean {
+        val safe = TARGET_PACKAGE.replace(Regex("[^a-zA-Z0-9_.]"), "")
+        val resolve = RootShell.exec(
+            "cmd package resolve-activity --brief -a android.intent.action.MAIN " +
+                "-c android.intent.category.LAUNCHER $safe | tail -1"
+        )
+        val comp = resolve.output.trim()
+        if (resolve.exitCode == 0 && comp.contains("/")) {
+            RootShell.exec("am start -n $comp")
+            return true
+        }
         try {
             val intent = context.packageManager.getLaunchIntentForPackage(TARGET_PACKAGE)
             if (intent != null) {
@@ -191,6 +245,21 @@ object InjectorBridge {
             "monkey -p $TARGET_PACKAGE -c android.intent.category.LAUNCHER 1"
         )
         return r.exitCode == 0
+    }
+
+    /** Bawa game ke depan tanpa inject (pola Traffic Rider — dipakai
+     *  setelah inject selesai supaya user langsung mendarat di game
+     *  dengan overlay tampil, bukan menatap layar log). */
+    fun bringGameToFront() {
+        val safe = TARGET_PACKAGE.replace(Regex("[^a-zA-Z0-9_.]"), "")
+        val resolve = RootShell.exec(
+            "cmd package resolve-activity --brief -a android.intent.action.MAIN " +
+                "-c android.intent.category.LAUNCHER $safe | tail -1"
+        )
+        val comp = resolve.output.trim()
+        if (resolve.exitCode == 0 && comp.contains("/")) {
+            RootShell.exec("am start -n $comp")
+        }
     }
 
     /** Tulis config toggle ke cache game via root (dibaca payload tiap 500 ms). */
@@ -215,7 +284,9 @@ object InjectorBridge {
      * SELinux + chmod 755). Cadangan: /data/local/tmp.
      */
     private fun stagePayload(context: Context): String? {
-        val src = payloadPath(context)
+        // Sumber payload: lib dir bila ada, bila tidak ekstrak dari APK
+        // (jaring pengaman yang sama seperti injector — v1.0).
+        val src = resolveNativeLib(context, PAYLOAD_LIB) ?: return null
         val gameStage = RootShell.exec(
             "D='$GAME_CACHE_DIR'; " +
             "mkdir -p \"\$D\" && cp '$src' '$PAYLOAD_GAME' && " +
@@ -237,7 +308,22 @@ object InjectorBridge {
      * yang sudah ter-map = crash.
      */
     fun inject(context: Context, pid: Int): InjectResult {
-        ensureExecutable(context)
+        // Pre-flight (pelajaran v1.0): injector HARUS ada sebagai file
+        // sebelum dieksekusi. Bila tidak ada, JANGAN panggil 3x buta —
+        // kembalikan 127 dengan diagnosis yang menyebut path persisnya.
+        val injector = resolveNativeLib(context, INJECTOR_LIB)
+        if (injector == null) {
+            val ls = RootShell.exec(
+                "ls -l '${context.applicationInfo.nativeLibraryDir}' 2>&1"
+            ).output.trim()
+            return InjectResult(
+                127, "",
+                "libinjector.so TIDAK ditemukan di nativeLibraryDir dan gagal diekstrak dari APK.\n" +
+                    "nativeLibraryDir: ${context.applicationInfo.nativeLibraryDir}\n$ls\n" +
+                    "Uninstall aplikasi ini lalu install ulang APK v1.0.1."
+            )
+        }
+        RootShell.exec("chmod 755 '$injector'")
         if (isPayloadLoaded(pid)) {
             return InjectResult(
                 0, "",
@@ -245,10 +331,11 @@ object InjectorBridge {
             )
         }
         val staged = stagePayload(context)
-        val primary = staged ?: payloadPath(context)
-        val attempts = arrayOf(primary, payloadPath(context), primary)
+        val nativePayload = resolveNativeLib(context, PAYLOAD_LIB) ?: payloadPath(context)
+        val primary = staged ?: nativePayload
+        val attempts = arrayOf(primary, nativePayload, primary)
         var last: InjectResult? = null
-        val allDiag = StringBuilder()
+        val allDiag = StringBuilder("injector: $injector")
         for ((i, path) in attempts.withIndex()) {
             if (i > 0) {
                 Thread.sleep(1000)
@@ -259,7 +346,7 @@ object InjectorBridge {
                     return InjectResult(0, "", full)
                 }
             }
-            val r = RootShell.exec("${injectorPath(context)} $pid $path")
+            val r = RootShell.exec("'$injector' $pid $path")
             var diag = r.output.trim()
             if (diag.isEmpty()) {
                 val log = RootShell.exec("cat '$INJECT_LOG' 2>/dev/null")
@@ -281,19 +368,5 @@ object InjectorBridge {
             last?.exitCode ?: 1, last?.output ?: "",
             if (allDiag.isNotEmpty()) allDiag.toString() else "inject gagal tanpa percobaan"
         )
-    }
-
-    /** Arti exit code injector dalam bahasa manusia. */
-    fun failureReason(exitCode: Int): String = when (exitCode) {
-        0 -> "OK"
-        2 -> "argumen injector salah (bug aplikasi)"
-        3 -> "libdl/libc tidak ketemu di proses injector sendiri"
-        4 -> "ptrace attach ditolak — root tidak aktif / SELinux menolak"
-        5 -> "libc/libdl tidak ketemu di proses game (layout maps aneh)"
-        6 -> "alokasi memori di proses game gagal"
-        7 -> "tulis path payload ke memori game gagal"
-        8 -> "panggilan dlopen di game tidak selesai (timeout; bila tetap gagal, salin diagnosis)"
-        9 -> "dlopen payload ditolak — baca baris dlerror di diagnosis (alasan linker yang sebenarnya)"
-        else -> "gagal tak dikenal (exit=$exitCode)"
     }
 }
