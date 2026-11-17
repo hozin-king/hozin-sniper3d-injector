@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hozin Sniper 3D Injector</string>
+    <string name="info_text">Target: Sniper 3D (com.fungames.sniper3d) v7.15.0 — mode MISI saja (solo lawan AI).\n\nTap \"Inject ke Sniper 3D\" — game otomatis diluncurkan bila belum jalan, lalu inject otomatis. Menu mod + ESP muncul sebagai tombol mengambang di dalam game.\n\nSemua fitur nonaktif di Arena/PvP (gate fail-closed). Tanpa jaminan anti-ban — server bisa menandai akun.</string>
+</resources>
