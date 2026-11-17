@@ -71,6 +71,10 @@ android {
     }
     buildFeatures {
         viewBinding = true
+        // v1.0.5: BuildConfig.VERSION_NAME dipakai menu + log supaya
+        // string versi selalu sama dengan versionName (AGP 8.x tidak
+        // men-generate BuildConfig secara default).
+        buildConfig = true
     }
     packaging {
         // Dobby membangun dobby SHARED + dobby_static; payload hanya
