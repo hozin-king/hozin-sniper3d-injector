@@ -90,11 +90,15 @@ set_target_properties(payload PROPERTIES OUTPUT_NAME "payload")
 # Output dinamai .so supaya AGP membundelnya ke lib/<ABI>/, bukan
 # membuangnya. Confirm setelah build: lib/arm64-v8a/libinjector.so ada
 # di APK dan berukuran seperti binary asli (bukan 0 byte).
+# v1.0.4: mekanisme inject PINDAH TOTAL ke kerangka Traffic Rider
+# (injector.c — port verbatim dari BUSSID, varian TR + hardening
+# v1.0.1: validasi stack/pc + WIFSTOPPED). Menggantikan remote dlopen
+# C++ Sniper (remote_call_arm64.cpp: brk di scratch RWX) yang tetap
+# crash di POCO tanpa diagnosis. TR: path ditulis ke stack target,
+# lr=0 -> SIGSEGV trap sebagai marker kembali (TANPA brk di mana pun),
+# tanpa timeout — waitpid sampai trap.
 add_executable(libinjector
-    injector/injector_main.cpp
-    injector/proc_maps.cpp
-    injector/remote_call_arm64.cpp
+    injector/injector.c
 )
 target_link_libraries(libinjector log dl)
-target_link_options(libinjector PRIVATE -static-libstdc++)
 set_target_properties(libinjector PROPERTIES SUFFIX ".so")

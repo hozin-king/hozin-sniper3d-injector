@@ -45,7 +45,11 @@ object InjectorBridge {
         "/data/data/com.fungames.sniper3d/cache/hozinsniper_payload.so"
     private const val GAME_CACHE_DIR = "/data/data/com.fungames.sniper3d/cache"
     private const val GAME_DATA_DIR = "/data/data/com.fungames.sniper3d"
-    const val INJECT_LOG = "/data/local/tmp/hozinsniper_inject.log"
+    /** Hasil remote-dlopen JSON dari injector TR
+     *  ({"dlopen":"ok"|"null"|"crash"|"exited"|"aborted","signal":N,
+     *  "handle":"0x..","pc_after":"0x..","dlerror":"..."}). Ditulis
+     *  injector sebagai root; dibaca aplikasi via su. */
+    const val INJECT_RESULT = "/data/local/tmp/hozinsniper_inject.json"
 
     /** File status payload (payload menulis ke yang pertama bisa). */
     private const val PAYLOAD_STATUS_TMP = "/data/local/tmp/hozinsniper_payload.log"
@@ -186,17 +190,20 @@ object InjectorBridge {
         return PayloadStatus(status, failed, libSize, mode, hook, raw)
     }
 
-    /** Arti exit code injector dalam bahasa manusia. */
+    /** Arti exit code injector dalam bahasa manusia.
+     *  v1.0.4 (kerangka TR): injector mengembalikan exit 0 bila ia
+     *  sempat jalan — hasil remote-dlopen ada di file JSON, BUKAN di
+     *  exit code. Status dlopen dipetakan ke kode sintetis 9–12 supaya
+     *  MainActivity (exitCode == 0) tak berubah. */
     fun failureReason(exitCode: Int): String = when (exitCode) {
         0 -> "OK"
+        1 -> "injector gagal sebelum attach — baca diagnosis (resolusi dlopen / attach ditolak)"
         2 -> "argumen injector salah (bug aplikasi)"
-        3 -> "libdl/libc tidak ketemu di proses injector sendiri"
-        4 -> "ptrace attach ditolak — root tidak aktif / SELinux menolak"
-        5 -> "libc/libdl tidak ketemu di proses game (layout maps aneh)"
-        6 -> "alokasi memori di proses game gagal"
-        7 -> "tulis path payload ke memori game gagal"
-        8 -> "panggilan dlopen di game tidak selesai (timeout; bila tetap gagal, salin diagnosis)"
-        9 -> "dlopen payload ditolak — baca baris dlerror di diagnosis (alasan linker yang sebenarnya)"
+        9 -> "dlopen payload mengembalikan NULL — baca baris dlerror di diagnosis (alasan linker yang sebenarnya)"
+        10 -> "target CRASH di dalam dlopen (constructor payload / init native) — sinyal + pc ada di diagnosis"
+        11 -> "inject dibatalkan sebelum hijack (pc target bukan executable / stack tidak aman) — game tidak disentuh"
+        12 -> "target keluar saat dlopen (game mati di tengah inject)"
+        -1 -> "perintah injector TIMEOUT (30 dtk) — game mungkin membeku di dlopen; buka game manual dan cek"
         127 -> "injector tidak ditemukan / tidak bisa dieksekusi (command not found — baca baris 'injector:' di diagnosis)"
         else -> "gagal tak dikenal (exit=$exitCode)"
     }
@@ -347,11 +354,52 @@ object InjectorBridge {
         return if (r.exitCode == 0) PAYLOAD_TMP else null
     }
 
+    /** Ambil nilai string untuk key pada JSON sederhana {"k":"v",...}
+     *  (pola TR ModInjector.jsonVal). */
+    private fun jsonVal(json: String, key: String): String {
+        val pat = "\"$key\":\""
+        val i = json.indexOf(pat)
+        if (i < 0) return ""
+        val s = i + pat.length
+        val e = json.indexOf('"', s)
+        return if (e > s) json.substring(s, e) else ""
+    }
+
+    /** Ambil nilai angka untuk key pada JSON sederhana {"k":123,...}
+     *  (dipakai "signal" — satu-satunya nilai numerik di inject.json). */
+    private fun jsonNumVal(json: String, key: String): String {
+        val pat = "\"$key\":"
+        val i = json.indexOf(pat)
+        if (i < 0) return ""
+        val s = i + pat.length
+        val eComma = json.indexOf(',', s)
+        val eBrace = json.indexOf('}', s)
+        val e = when {
+            eComma < 0 -> eBrace
+            eBrace < 0 -> eComma
+            else -> minOf(eComma, eBrace)
+        }
+        return if (e > s) json.substring(s, e).trim() else ""
+    }
+
+    /** Baca hasil inject JSON yang ditulis injector (TR). "" bila tak ada. */
+    private fun readInjectResultJson(): String {
+        val r = RootUtil.su("cat '$INJECT_RESULT' 2>/dev/null")
+        return r.output.trim()
+    }
+
     /**
      * Inject + kumpulkan diagnosis. Retry s.d. 3x (cache game → native
      * lib → cache game), cek maps antar percobaan — dlopen percobaan
      * sebelumnya bisa selesai TERLAMBAT, dan dlopen kedua ke payload
      * yang sudah ter-map = crash.
+     *
+     * v1.0.4: mekanisme inject PINDAH TOTAL ke kerangka Traffic Rider
+     * (injector.c). Injector TR mengembalikan exit 0 bila ia sempat
+     * jalan — hasil remote-dlopen ada di file JSON, BUKAN di exit code
+     * (pola lama v1.0–v1.0.3: exit 0..9). "ok" = dlopen berhasil;
+     * "null"/"crash"/"aborted"/"exited" dipetakan ke kode sintetis
+     * 9/10/11/12 supaya MainActivity (exitCode == 0) tak berubah.
      */
     fun inject(context: Context, pid: Int): InjectResult {
         // Pre-flight (pelajaran v1.0): injector HARUS ada sebagai file
@@ -381,7 +429,10 @@ object InjectorBridge {
         val primary = staged ?: nativePayload
         val attempts = arrayOf(primary, nativePayload, primary)
         var last: InjectResult? = null
-        val allDiag = StringBuilder("injector: $injector")
+        val allDiag = StringBuilder("injector: $injector (kerangka TR v1.0.4)")
+        // Hapus hasil inject lama supaya percobaan ini tidak membaca
+        // JSON basi (pola TR).
+        RootUtil.su("rm -f '$INJECT_RESULT'")
         for ((i, path) in attempts.withIndex()) {
             if (i > 0) {
                 Thread.sleep(1000)
@@ -392,27 +443,46 @@ object InjectorBridge {
                     return InjectResult(0, "", full)
                 }
             }
-            // Timeout 30 dtk (v1.0.3): injector bisa menunggu dlopen
-            // lambat s.d. ~25 dtk sebelum menyerah — timeout shell 15 dtk
-            // (default) akan membunuhnya di tengah tunggu dan
-            // meninggalkan thread game kembali ke brk tanpa tracer.
+            // TR: injector memblokir di waitpid sampai trap dlopen
+            // (tanpa timeout internal); timeout shell 30 dtk hanya
+            // jaring pengaman — dlopen normal <1 dtk.
             val r = RootUtil.su("'$injector' $pid $path", 30)
             var diag = r.output.trim()
-            if (diag.isEmpty()) {
-                val log = RootUtil.su("cat '$INJECT_LOG' 2>/dev/null")
-                diag = log.output.trim()
+            // Hasil utama: JSON injector (dlopen + dlerror + signal).
+            val injJson = readInjectResultJson()
+            val dlres = jsonVal(injJson, "dlopen")
+            val dlerror = jsonVal(injJson, "dlerror")
+            val injSignal = jsonNumVal(injJson, "signal")
+            val injHandle = jsonVal(injJson, "handle")
+            val injPc = jsonVal(injJson, "pc_after")
+            // Petakan status dlopen ke exit code (MainActivity: 0 = sukses).
+            val code = when {
+                r.output == "TIMEOUT" -> -1
+                dlres == "ok" -> 0
+                dlres == "null" -> 9
+                dlres == "crash" -> 10
+                dlres == "aborted" -> 11
+                dlres == "exited" -> 12
+                r.exitCode != 0 -> r.exitCode
+                else -> 1
+            }
+            if (injJson.isNotEmpty()) {
+                diag = "$diag\ninject.json: dlopen=$dlres signal=$injSignal handle=$injHandle pc_after=$injPc" +
+                    (if (dlerror.isNotEmpty()) "\ndlerror: $dlerror" else "")
             }
             val ctor = readCtorLog()
             if (ctor.isNotEmpty()) diag = "$diag\nctor log:\n$ctor"
             if (diag.isNotEmpty()) diag = "percobaan ${i + 1}/3 — payload path dipakai: $path\n$diag"
-            if (r.exitCode != 0) {
-                val failLine = "percobaan ${i + 1}/3 GAGAL: exit=${r.exitCode} — ${failureReason(r.exitCode)}"
+            if (code != 0) {
+                val failLine = "percobaan ${i + 1}/3 GAGAL: ${failureReason(code)}"
                 diag = if (diag.isNotEmpty()) "$diag\n$failLine" else failLine
             }
             if (allDiag.isNotEmpty()) allDiag.append("\n")
             allDiag.append(diag)
-            last = InjectResult(r.exitCode, r.output, diag)
-            if (r.exitCode == 0) return InjectResult(r.exitCode, r.output, allDiag.toString())
+            last = InjectResult(code, r.output, diag)
+            if (code == 0) return InjectResult(0, r.output, allDiag.toString())
+            // "crash" = mekanisme/target rusak — retry sia-sia (pola TR: break).
+            if (dlres == "crash") break
         }
         return InjectResult(
             last?.exitCode ?: 1, last?.output ?: "",
