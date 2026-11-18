@@ -7,9 +7,13 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.hozinking.sniper3dinjector.databinding.ActivityMainBinding
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Hozin Sniper 3D Injector v1.0.6 — launcher root untuk Sniper 3D
+ * Hozin Sniper 3D Injector v1.0.7 — launcher root untuk Sniper 3D
  * (com.fungames.sniper3d) v7.15.0, Unity 6 IL2CPP. Game TIDAK dibundel —
  * user install sendiri dari Play Store.
  *
@@ -45,6 +49,10 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile
     private var autoRunning = false
+
+    /** v1.0.7: file log run inject yang sedang jalan (null di luar run). */
+    @Volatile
+    private var runLogFile: File? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,6 +102,7 @@ class MainActivity : AppCompatActivity() {
     private fun runAutoInject() {
         autoRunning = true
         try {
+            startRunLog()
             log("== Inject v${BuildConfig.VERSION_NAME} — alur otomatis ==")
             // Tombol mengambang muncul duluan — anti gagal.
             FloatingService.start(this)
@@ -211,8 +220,32 @@ class MainActivity : AppCompatActivity() {
                 Thread { InjectorBridge.bringGameToFront() }.start()
             }
         } finally {
+            // v1.0.7: tutup run log — baris path ini ikut masuk file
+            // karena runLogFile masih terpasang saat log() dipanggil.
+            runLogFile?.let { log("log tersimpan: ${it.absolutePath}") }
+            runLogFile = null
             autoRunning = false
         }
+    }
+
+    /** v1.0.7: mulai file log per-run di penyimpanan external aplikasi
+     *  (/sdcard/Android/data/<pkg>/files/logs/inject-*.log — bisa
+     *  dibuka dari file manager tanpa root). Bila external tak tersedia,
+     *  fallback ke filesDir/logs internal + keterangan di log UI. */
+    private fun startRunLog() {
+        val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+        val stampHuman = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val ext = getExternalFilesDir(null)
+        val dir = if (ext != null) File(ext, "logs") else File(filesDir, "logs")
+        try {
+            dir.mkdirs()
+            val f = File(dir, "inject-$stamp.log")
+            f.appendText("Hozin Sniper 3D Injector v${BuildConfig.VERSION_NAME} — run $stampHuman\n")
+            runLogFile = f
+        } catch (_: Exception) {
+            runLogFile = null
+        }
+        if (ext == null) log("penyimpanan external tak tersedia — log run disimpan internal")
     }
 
     /** Poll file status payload sampai timeout detik; status "" bila tak muncul. */
@@ -229,6 +262,12 @@ class MainActivity : AppCompatActivity() {
     private fun log(line: String) {
         runOnUiThread {
             binding.textLog.append(line + "\n")
+        }
+        // v1.0.7: baris yang sama di-append ke file log run ini
+        // (best-effort — kegagalan tulis tidak boleh mengganggu inject).
+        try {
+            runLogFile?.appendText(line + "\n")
+        } catch (_: Exception) {
         }
     }
 }
