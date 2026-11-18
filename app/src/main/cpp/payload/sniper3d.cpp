@@ -156,13 +156,29 @@ struct State {
     Il2CppMethod* personGetBaseHealth = nullptr;
     Il2CppMethod* shooterGetCurrentAmmo = nullptr;
     Il2CppMethod* shooterSetCurrentAmmo = nullptr;
-    Il2CppMethod* dataGetSpread = nullptr;
-    Il2CppMethod* dataSetSpread = nullptr;
-    Il2CppMethod* dataGetReloadTime = nullptr;
-    Il2CppMethod* dataSetReloadTime = nullptr;
-    Il2CppMethod* dataGetMaxZoom = nullptr;
-    Il2CppMethod* dataSetMaxZoom = nullptr;
-    Il2CppMethod* dataGetClipSize = nullptr;
+    // WeaponData.Params — aksesor Spread/ReloadTime/MaxZoom/ClipSize
+    // ada di class Params (IParams), BUKAN di WeaponData (PARTIAL v1.0.6).
+    // get_UpgradedParams/get_BaseParams di-resolve di sini; accessor +
+    // field Params di-resolve lazy dari objek Params hidup pertama
+    // (ensure_params_access — pompa main-thread saja).
+    Il2CppMethod* dataGetUpgradedParams = nullptr;
+    Il2CppMethod* dataGetBaseParams = nullptr;
+    Il2CppMethod* pGetSpread = nullptr;
+    Il2CppMethod* pSetSpread = nullptr;
+    Il2CppMethod* pGetReloadTime = nullptr;
+    Il2CppMethod* pSetReloadTime = nullptr;
+    Il2CppMethod* pGetMaxZoom = nullptr;
+    Il2CppMethod* pSetMaxZoom = nullptr;
+    Il2CppMethod* pGetClipSize = nullptr;
+    Il2CppField* pSpreadField = nullptr;
+    Il2CppField* pReloadTimeField = nullptr;
+    Il2CppField* pMaxZoomField = nullptr;
+    Il2CppField* pClipSizeField = nullptr;
+    bool paramsAccessTried = false;
+    bool paramsSpreadOk = false;
+    bool paramsReloadOk = false;
+    bool paramsZoomOk = false;
+    bool paramsClipOk = false;
 
     // fields
     Il2CppField* personCurrentHealth = nullptr;
@@ -522,13 +538,19 @@ bool resolve_all() {
     needMethod(g.personGetBaseHealth, g.personClass, "get_BaseHealth", 0);
     needMethod(g.shooterGetCurrentAmmo, g.shooterClass, "get_CurrentAmmo", 0);
     needMethod(g.shooterSetCurrentAmmo, g.shooterClass, "set_CurrentAmmo", 1);
-    needMethod(g.dataGetSpread, g.weaponDataClass, "get_Spread", 0);
-    needMethod(g.dataSetSpread, g.weaponDataClass, "set_Spread", 1);
-    needMethod(g.dataGetReloadTime, g.weaponDataClass, "get_ReloadTime", 0);
-    needMethod(g.dataSetReloadTime, g.weaponDataClass, "set_ReloadTime", 1);
-    needMethod(g.dataGetMaxZoom, g.weaponDataClass, "get_MaxZoom", 0);
-    needMethod(g.dataSetMaxZoom, g.weaponDataClass, "set_MaxZoom", 1);
-    needMethod(g.dataGetClipSize, g.weaponDataClass, "get_ClipSize", 0);
+    // Objek Params hidup diambil via get_UpgradedParams (fallback
+    // get_BaseParams) — keduanya jalur ke objek yang sama, satu yang
+    // hidup sudah cukup: jangan PARTIAL karena jalur cadangannya gagal.
+    needMethod(g.dataGetUpgradedParams, g.weaponDataClass, "get_UpgradedParams", 0);
+    needMethod(g.dataGetBaseParams, g.weaponDataClass, "get_BaseParams", 0);
+    if (g.dataGetUpgradedParams || g.dataGetBaseParams) {
+        g.failed.erase(std::remove(g.failed.begin(), g.failed.end(),
+                                   "method:get_UpgradedParams"),
+                       g.failed.end());
+        g.failed.erase(std::remove(g.failed.begin(), g.failed.end(),
+                                   "method:get_BaseParams"),
+                       g.failed.end());
+    }
 
     auto needField = [&](Il2CppField*& slot, Il2CppClass* klass, const char* name) {
         if (!klass) return;
@@ -776,6 +798,103 @@ WeaponDataOrig& orig_for(void* dataObj) {
     return g.weaponDataOrig[dataObj];
 }
 
+// ---------------------------------------------------------------- Params
+// Aksesor Spread/ReloadTime/MaxZoom/ClipSize hidup di class bersarang
+// WeaponData.Params (implementasi IParams), BUKAN di WeaponData —
+// resolve langsung di WeaponData selalu NULL (PARTIAL v1.0.6).
+// Jalur: WeaponData -> get_UpgradedParams() (fallback get_BaseParams())
+// -> objek IParams hidup -> accessor/field di class-nya.
+// HANYA dipanggil dari pompa main-thread (runtime_invoke legal di sana).
+void ensure_params_access(Il2CppObject* paramsObj) {
+    if (g.paramsAccessTried) return;
+    g.paramsAccessTried = true;
+    Il2CppClass* pc = paramsObj ? g.object_get_class(paramsObj) : nullptr;
+    if (!pc) {
+        add_failed("params:class");
+        return;
+    }
+    g.pGetSpread = find_method(pc, "get_Spread", 0);
+    g.pSetSpread = find_method(pc, "set_Spread", 1);
+    g.pGetReloadTime = find_method(pc, "get_ReloadTime", 0);
+    g.pSetReloadTime = find_method(pc, "set_ReloadTime", 1);
+    g.pGetMaxZoom = find_method(pc, "get_MaxZoom", 0);
+    g.pSetMaxZoom = find_method(pc, "set_MaxZoom", 1);
+    g.pGetClipSize = find_method(pc, "get_ClipSize", 0);
+    g.pSpreadField = g.class_get_field_from_name(pc, "_spread");
+    g.pReloadTimeField = g.class_get_field_from_name(pc, "_reloadTime");
+    g.pMaxZoomField = g.class_get_field_from_name(pc, "_maxZoom");
+    g.pClipSizeField = g.class_get_field_from_name(pc, "_clipSize");
+    // Per stat: method (get+set) diutamakan, field privat fallback.
+    // Catat ke failed HANYA bila kedua jalur gagal untuk stat itu.
+    g.paramsSpreadOk = (g.pGetSpread && g.pSetSpread) || g.pSpreadField;
+    g.paramsReloadOk = (g.pGetReloadTime && g.pSetReloadTime) || g.pReloadTimeField;
+    g.paramsZoomOk = (g.pGetMaxZoom && g.pSetMaxZoom) || g.pMaxZoomField;
+    g.paramsClipOk = g.pGetClipSize || g.pClipSizeField;
+    if (!g.paramsSpreadOk) add_failed("params:Spread");
+    if (!g.paramsReloadOk) add_failed("params:ReloadTime");
+    if (!g.paramsZoomOk) add_failed("params:MaxZoom");
+    if (!g.paramsClipOk) add_failed("params:ClipSize");
+}
+
+Il2CppObject* live_params_for(Il2CppObject* dataObj) {
+    if (!dataObj) return nullptr;
+    Il2CppObject* p = nullptr;
+    if (g.dataGetUpgradedParams) p = invoke_obj(g.dataGetUpgradedParams, dataObj, nullptr);
+    if (!p && g.dataGetBaseParams) p = invoke_obj(g.dataGetBaseParams, dataObj, nullptr);
+    if (p) ensure_params_access(p);
+    return p;
+}
+
+bool params_get_float(Il2CppObject* p, Il2CppMethod* getter, Il2CppField* field, float& out) {
+    if (getter) return invoke_value<float>(getter, p, nullptr, out);
+    if (field) {
+        float v = 0;
+        g.field_get_value(p, field, &v);
+        out = v;
+        return true;
+    }
+    return false;
+}
+
+bool params_set_float(Il2CppObject* p, Il2CppMethod* setter, Il2CppField* field, float v) {
+    if (setter) {
+        void* a[1] = {&v};
+        return invoke_obj(setter, p, a) != nullptr;
+    }
+    if (field) {
+        g.field_set_value(p, field, &v);
+        return true;
+    }
+    return false;
+}
+
+bool params_get_int(Il2CppObject* p, Il2CppMethod* getter, Il2CppField* field, int& out) {
+    if (getter) return invoke_value<int>(getter, p, nullptr, out);
+    if (field) {
+        int v = 0;
+        g.field_get_value(p, field, &v);
+        out = v;
+        return true;
+    }
+    return false;
+}
+
+// Simpan nilai asli ketiga stat SEKALIGUS (satu flag `saved` dipakai
+// bersama — menyimpan per stat membuat urutan toggle mengacaukan
+// restore: stat yang belum sempat disimpan kembali ke 0).
+void save_orig(Il2CppObject* dataObj, Il2CppObject* paramsObj) {
+    WeaponDataOrig& o = orig_for(dataObj);
+    if (o.saved) return;
+    float s = 0, r = 0, m = 0;
+    if (g.paramsSpreadOk) params_get_float(paramsObj, g.pGetSpread, g.pSpreadField, s);
+    if (g.paramsReloadOk) params_get_float(paramsObj, g.pGetReloadTime, g.pReloadTimeField, r);
+    if (g.paramsZoomOk) params_get_float(paramsObj, g.pGetMaxZoom, g.pMaxZoomField, m);
+    o.spread = s;
+    o.reloadTime = r;
+    o.maxZoom = m;
+    o.saved = true;
+}
+
 // v1.0.5: HANYA dipanggil dari pompa main-thread. cfg = snapshot
 // config yang dipublish worker; prev = config pompa sebelumnya
 // (untuk restore nilai asli saat toggle dimatikan).
@@ -789,43 +908,30 @@ void apply_features(const Config& cfg, const Config& prev) {
     if (mode != Mode::MISI) return;
     auto weapons = find_objects(g.weaponClass);
 
-    // No-spread: _spreadAmount = 0 + WeaponData.Spread = 0.
+    // No-spread: _spreadAmount = 0 + Params.Spread = 0.
     // v1.0.2: _spreadAmount selalu di-nol-kan di misi meski toggle OFF.
+    // v1.0.8: Spread diakses via objek Params (bukan WeaponData).
     for (Il2CppObject* weapon : weapons) {
         if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
         float zero = 0.0f;
         if (cfg.noSpread) {
             field_set(weapon, g.weaponSpreadAmount, zero);
         }
+        if (!cfg.noSpread && !prev.noSpread) continue;  // tak ada kerja Spread
+        Il2CppObject* data = nullptr;
+        field_get(weapon, g.weaponDataField, data);
+        if (!data) continue;
+        Il2CppObject* p = live_params_for(data);
+        if (!p || !g.paramsSpreadOk) continue;
         if (cfg.noSpread) {
-            Il2CppObject* data = nullptr;
-            field_get(weapon, g.weaponDataField, data);
-            if (data && g.dataSetSpread && g.dataGetSpread) {
-                WeaponDataOrig& o = orig_for(data);
-                if (!o.saved) {
-                    float s = 0;
-                    invoke_value<float>(g.dataGetSpread, data, nullptr, s);
-                    o.spread = s;
-                    o.saved = true;
-                }
-                float z = 0;
-                void* params[1] = {&z};
-                invoke_obj(g.dataSetSpread, data, params);
-            }
+            save_orig(data, p);
+            params_set_float(p, g.pSetSpread, g.pSpreadField, 0.0f);
         }
-    }
-    // No-spread dimatikan → kembalikan Spread senjata yang masih hidup.
-    if (prev.noSpread && !cfg.noSpread && g.dataSetSpread) {
-        for (Il2CppObject* weapon : weapons) {
-            if (!g.object_get_class(weapon)) continue;  // objek sudah di-destroy
-            Il2CppObject* data = nullptr;
-            field_get(weapon, g.weaponDataField, data);
-            if (!data) continue;
+        // No-spread dimatikan → kembalikan Spread senjata yang masih hidup.
+        if (prev.noSpread && !cfg.noSpread) {
             auto it = g.weaponDataOrig.find(data);
             if (it != g.weaponDataOrig.end() && it->second.saved) {
-                float s = it->second.spread;
-                void* params[1] = {&s};
-                invoke_obj(g.dataSetSpread, data, params);
+                params_set_float(p, g.pSetSpread, g.pSpreadField, it->second.spread);
             }
         }
     }
@@ -837,44 +943,30 @@ void apply_features(const Config& cfg, const Config& prev) {
         if (!g.object_get_class(shooter)) return;  // objek sudah di-destroy
         Il2CppObject* data = nullptr;
         field_get(shooter, g.shooterWeaponData, data);
-        if (data) {
-            WeaponDataOrig& o = orig_for(data);
-            if (!o.saved) {
-                float s = 0, r = 0, m = 0;
-                if (g.dataGetSpread) invoke_value<float>(g.dataGetSpread, data, nullptr, s);
-                if (g.dataGetReloadTime) invoke_value<float>(g.dataGetReloadTime, data, nullptr, r);
-                if (g.dataGetMaxZoom) invoke_value<float>(g.dataGetMaxZoom, data, nullptr, m);
-                o.spread = s;
-                o.reloadTime = r;
-                o.maxZoom = m;
-                o.saved = true;
-            }
-            if (cfg.noReload && g.dataSetReloadTime && g.shooterSetCurrentAmmo &&
-                g.dataGetClipSize) {
-                // ReloadTime = 0 (reload instan) + ammo selalu penuh.
-                float z = 0;
-                void* params[1] = {&z};
-                invoke_obj(g.dataSetReloadTime, data, params);
-                int clip = 0;
-                if (invoke_value<int>(g.dataGetClipSize, data, nullptr, clip) && clip > 0) {
-                    void* ap[1] = {&clip};
-                    invoke_obj(g.shooterSetCurrentAmmo, shooter, ap);
+        if (data && (cfg.noReload || prev.noReload || cfg.zoomFar || prev.zoomFar)) {
+            Il2CppObject* p = live_params_for(data);
+            if (p) {
+                save_orig(data, p);
+                if (cfg.noReload && g.paramsReloadOk && g.paramsClipOk &&
+                    g.shooterSetCurrentAmmo) {
+                    // ReloadTime = 0 (reload instan) + ammo selalu penuh.
+                    params_set_float(p, g.pSetReloadTime, g.pReloadTimeField, 0.0f);
+                    int clip = 0;
+                    if (params_get_int(p, g.pGetClipSize, g.pClipSizeField, clip) && clip > 0) {
+                        void* ap[1] = {&clip};
+                        invoke_obj(g.shooterSetCurrentAmmo, shooter, ap);
+                    }
                 }
-            }
-            if (prev.noReload && !cfg.noReload && g.dataSetReloadTime && o.saved) {
-                float r = o.reloadTime;
-                void* params[1] = {&r};
-                invoke_obj(g.dataSetReloadTime, data, params);
-            }
-            if (cfg.zoomFar && g.dataSetMaxZoom) {
-                float mz = 30.0f;
-                void* params[1] = {&mz};
-                invoke_obj(g.dataSetMaxZoom, data, params);
-            }
-            if (prev.zoomFar && !cfg.zoomFar && g.dataSetMaxZoom && o.saved) {
-                float m = o.maxZoom;
-                void* params[1] = {&m};
-                invoke_obj(g.dataSetMaxZoom, data, params);
+                WeaponDataOrig& o = orig_for(data);
+                if (prev.noReload && !cfg.noReload && g.paramsReloadOk && o.saved) {
+                    params_set_float(p, g.pSetReloadTime, g.pReloadTimeField, o.reloadTime);
+                }
+                if (cfg.zoomFar && g.paramsZoomOk) {
+                    params_set_float(p, g.pSetMaxZoom, g.pMaxZoomField, 30.0f);
+                }
+                if (prev.zoomFar && !cfg.zoomFar && g.paramsZoomOk && o.saved) {
+                    params_set_float(p, g.pSetMaxZoom, g.pMaxZoomField, o.maxZoom);
+                }
             }
         }
     }

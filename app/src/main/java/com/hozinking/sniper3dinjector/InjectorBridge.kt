@@ -387,14 +387,21 @@ object InjectorBridge {
         val gameStage = RootUtil.su(
             "D='$GAME_CACHE_DIR'; " +
             "mkdir -p \"\$D\" && cp '$src' '$PAYLOAD_GAME' && " +
+            // v1.0.8: chown dan chcon MELAPOR TERPISAH (tes v1.0.6: keduanya
+            // gagal diam-diam, file staging root-owned + system_data_file
+            // → dlopen cache "not found"). UID dari stat; bila stat gagal,
+            // turunkan dari ls -lnd kolom ke-3.
             "U=\$(stat -c %u '$GAME_DATA_DIR' 2>/dev/null); " +
-            // v1.0.6: chown/chcon TIDAK LAGI disembunyikan (2>/dev/null) —
-            // tes v1.0.5 membuktikan keduanya gagal diam-diam sehingga
-            // file staging root-owned + konteks system_data_file dan
-            // dlopen cache "not found" 2x. Kegagalan kini TERCETAK.
-            "if [ -n \"\$U\" ]; then chown \"\$U\" '$PAYLOAD_GAME' || echo 'chown/chcon gagal — file cache kemungkinan tak bisa dibaca game'; fi; " +
+            "if [ -z \"\$U\" ]; then U=\$(ls -lnd '$GAME_DATA_DIR' 2>/dev/null | awk '{print \$3}'); fi; " +
+            "if [ -n \"\$U\" ]; then chown \"\$U\" '$PAYLOAD_GAME' && echo \"chown: ok (uid \$U)\" || echo 'chown GAGAL'; else echo 'chown DILEWATI (UID tak ketemu)'; fi; " +
             "chmod 755 '$PAYLOAD_GAME'; " +
-            "chcon --reference=\"\$D\" '$PAYLOAD_GAME' || echo 'chown/chcon gagal — file cache kemungkinan tak bisa dibaca game'; " +
+            // v1.0.8: chcon --reference TIDAK didukung toybox HP
+            // ("Unknown option 'reference=...'" di tes v1.0.6) — pakai
+            // restorecon (konteks benar incl. kategori dari policy);
+            // bila tak ada/gagal, salin konteks dir via ls -Zd + chcon.
+            "restorecon '$PAYLOAD_GAME' 2>/dev/null && echo 'restorecon: ok' || " +
+            "{ C=\$(ls -Zd \"\$D\" 2>/dev/null | awk '{print \$1}'); " +
+            "if [ -n \"\$C\" ]; then chcon \"\$C\" '$PAYLOAD_GAME' && echo \"chcon: ok (\$C)\" || echo 'chcon GAGAL'; else echo 'chcon DILEWATI (konteks dir tak ketemu)'; fi; }; " +
             "ls -l '$PAYLOAD_GAME'"
         )
         val verify = RootUtil.su(
