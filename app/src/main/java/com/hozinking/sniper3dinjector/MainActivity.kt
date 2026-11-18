@@ -9,7 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.hozinking.sniper3dinjector.databinding.ActivityMainBinding
 
 /**
- * Hozin Sniper 3D Injector v1.0.5 — launcher root untuk Sniper 3D
+ * Hozin Sniper 3D Injector v1.0.6 — launcher root untuk Sniper 3D
  * (com.fungames.sniper3d) v7.15.0, Unity 6 IL2CPP. Game TIDAK dibundel —
  * user install sendiri dari Play Store.
  *
@@ -151,14 +151,23 @@ class MainActivity : AppCompatActivity() {
                 if (pidAfter != null) "game masih jalan setelah inject (pid $pidAfter)"
                 else "game MATI setelah inject — kemungkinan crash saat remote call"
             )
+            // v1.0.6: pembeda kunci — ter-map tapi tanpa status =
+            // constructor/worker diam atau tulis gagal; tidak ter-map =
+            // dlopen tidak benar-benar load.
+            val mapped = pidAfter?.let { InjectorBridge.isPayloadLoaded(it) } ?: false
+            log("libpayload.so ter-map di game: ${if (mapped) "ya" else "tidak"}")
             var injectedOk = false
             if (result.exitCode == 0) {
                 val ps = waitForPayloadStatus(15)
-                val rawStatus = InjectorBridge.readPayloadStatus()
+                val (rawStatus, statusSrc) = InjectorBridge.readPayloadStatusWithSource()
                 log("--- isi file status payload ---")
+                if (statusSrc.isNotEmpty()) log("status dari: $statusSrc")
                 log(if (rawStatus.isNotEmpty()) rawStatus else "(file status payload belum ada)")
-                val ctorLog = InjectorBridge.readCtorLog()
-                if (ctorLog.isNotEmpty()) log("--- ctor log ---\n$ctorLog")
+                val (ctorLog, ctorSrc) = InjectorBridge.readCtorLogWithSource()
+                if (ctorLog.isNotEmpty()) {
+                    if (ctorSrc.isNotEmpty()) log("ctor log dari: $ctorSrc")
+                    log("--- ctor log ---\n$ctorLog")
+                }
                 val pidFinal = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
                 log(
                     if (pidFinal != null) "game: masih jalan (pid $pidFinal)"

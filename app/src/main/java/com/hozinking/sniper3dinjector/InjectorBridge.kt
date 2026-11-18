@@ -55,10 +55,19 @@ object InjectorBridge {
     private const val PAYLOAD_STATUS_TMP = "/data/local/tmp/hozinsniper_payload.log"
     private const val PAYLOAD_STATUS_CACHE =
         "/data/data/com.fungames.sniper3d/cache/hozinsniper_payload.log"
+    /** Kanal status/ctor KETIGA (v1.0.6): external files game — game UID
+     *  bisa tulis dir external-nya sendiri tanpa permission, root bisa
+     *  baca /sdcard. Dipakai bila cache + /data/local/tmp tak bisa
+     *  ditulis proses game (bukti tes v1.0.5: status + ctor kosong). */
+    private const val PAYLOAD_STATUS_EXT =
+        "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_payload.log"
 
     /** Marker constructor payload — apakah constructor sempat kembali. */
+    private const val CTOR_LOG_TMP = "/data/local/tmp/hozinsniper_ctor.log"
     private const val CTOR_LOG_CACHE =
         "/data/data/com.fungames.sniper3d/cache/hozinsniper_ctor.log"
+    private const val CTOR_LOG_EXT =
+        "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_ctor.log"
 
     /** Config toggle + data ESP (keduanya di cache game). */
     const val CONFIG_PATH = "$GAME_CACHE_DIR/hozinsniper_config.json"
@@ -154,18 +163,43 @@ object InjectorBridge {
         }
     }
 
-    /** Baca file status payload (dua lokasi, via root). "" bila tak ada. */
-    fun readPayloadStatus(): String {
+    /** Baca file status payload (tiga lokasi, via root). "" bila tak ada. */
+    fun readPayloadStatus(): String = readPayloadStatusWithSource().first
+
+    /** Baca file status payload dari 3 lokasi (tmp → cache → external).
+     *  @return Pair(isi file, sumber: "tmp"|"cache"|"external"|"") */
+    fun readPayloadStatusWithSource(): Pair<String, String> {
         val r = RootUtil.su(
-            "cat '$PAYLOAD_STATUS_TMP' 2>/dev/null || cat '$PAYLOAD_STATUS_CACHE' 2>/dev/null"
+            "for f in '$PAYLOAD_STATUS_TMP' '$PAYLOAD_STATUS_CACHE' '$PAYLOAD_STATUS_EXT'; do " +
+                "if [ -s \"\$f\" ]; then echo \"SRC=\$f\"; cat \"\$f\"; break; fi; done"
         )
-        return r.output.trim()
+        return splitSrc(r.output.trim())
     }
 
     /** Baca ctor log payload. "" bila tak ada. */
-    fun readCtorLog(): String {
-        val r = RootUtil.su("cat '$CTOR_LOG_CACHE' 2>/dev/null")
-        return r.output.trim()
+    fun readCtorLog(): String = readCtorLogWithSource().first
+
+    /** Baca ctor log payload dari 3 lokasi (tmp → cache → external). */
+    fun readCtorLogWithSource(): Pair<String, String> {
+        val r = RootUtil.su(
+            "for f in '$CTOR_LOG_TMP' '$CTOR_LOG_CACHE' '$CTOR_LOG_EXT'; do " +
+                "if [ -s \"\$f\" ]; then echo \"SRC=\$f\"; cat \"\$f\"; break; fi; done"
+        )
+        return splitSrc(r.output.trim())
+    }
+
+    /** Pisah baris marker "SRC=<path>" dari isi file. */
+    private fun splitSrc(out: String): Pair<String, String> {
+        if (!out.startsWith("SRC=")) return "" to ""
+        val nl = out.indexOf('\n')
+        if (nl < 0) return "" to ""
+        val src = when (out.substring(4, nl)) {
+            PAYLOAD_STATUS_TMP, CTOR_LOG_TMP -> "tmp"
+            PAYLOAD_STATUS_CACHE, CTOR_LOG_CACHE -> "cache"
+            PAYLOAD_STATUS_EXT, CTOR_LOG_EXT -> "external"
+            else -> "?"
+        }
+        return out.substring(nl + 1).trim() to src
     }
 
     /** Parse isi file status payload. status "" = file belum ada/tak terbaca. */
@@ -341,9 +375,8 @@ object InjectorBridge {
      * bilang "not found". Karena itu file DIVERIFIKASI terpisah
      * (test -f + ls -lZ, supaya konteks SELinux-nya ikut tercatat)
      * dan hasilnya masuk diagnosis. Bila verifikasi gagal, kembalikan
-     * null — inject() lalu memakai path lib injector sebagai
-     * percobaan PERTAMA, bukan membuang satu percobaan untuk path
-     * yang tidak ada.
+     * null — inject() lalu memakai path lib injector untuk percobaan
+     * ke-2, bukan membuang satu percobaan untuk path yang tidak ada.
      * @return Pair(path yang terverifikasi atau null, log staging)
      */
     private fun stagePayload(context: Context): Pair<String?, String> {
@@ -355,9 +388,13 @@ object InjectorBridge {
             "D='$GAME_CACHE_DIR'; " +
             "mkdir -p \"\$D\" && cp '$src' '$PAYLOAD_GAME' && " +
             "U=\$(stat -c %u '$GAME_DATA_DIR' 2>/dev/null); " +
-            "if [ -n \"\$U\" ]; then chown \"\$U\" '$PAYLOAD_GAME' 2>/dev/null; fi; " +
-            "chmod 755 '$PAYLOAD_GAME' && " +
-            "chcon --reference=\"\$D\" '$PAYLOAD_GAME' 2>/dev/null; " +
+            // v1.0.6: chown/chcon TIDAK LAGI disembunyikan (2>/dev/null) —
+            // tes v1.0.5 membuktikan keduanya gagal diam-diam sehingga
+            // file staging root-owned + konteks system_data_file dan
+            // dlopen cache "not found" 2x. Kegagalan kini TERCETAK.
+            "if [ -n \"\$U\" ]; then chown \"\$U\" '$PAYLOAD_GAME' || echo 'chown/chcon gagal — file cache kemungkinan tak bisa dibaca game'; fi; " +
+            "chmod 755 '$PAYLOAD_GAME'; " +
+            "chcon --reference=\"\$D\" '$PAYLOAD_GAME' || echo 'chown/chcon gagal — file cache kemungkinan tak bisa dibaca game'; " +
             "ls -l '$PAYLOAD_GAME'"
         )
         val verify = RootUtil.su(
@@ -407,10 +444,16 @@ object InjectorBridge {
     }
 
     /**
-     * Inject + kumpulkan diagnosis. Retry s.d. 3x (cache game → native
-     * lib → cache game), cek maps antar percobaan — dlopen percobaan
+     * Inject + kumpulkan diagnosis. Retry s.d. 3x (native lib → cache
+     * game → native lib), cek maps antar percobaan — dlopen percobaan
      * sebelumnya bisa selesai TERLAMBAT, dan dlopen kedua ke payload
      * yang sudah ter-map = crash.
+     *
+     * v1.0.6: lib-dir injector jadi percobaan PERTAMA — dlopen dari
+     * sana TERBUKTI OK di v1.0.4 + v1.0.5, sementara cache game gagal
+     * 2x ("not found" karena file staging root-owned + konteks
+     * SELinux system_data_file, chown/chcon gagal diam-diam). Cache
+     * tetap percobaan ke-2 (fallback bila lib-dir bermasalah).
      *
      * v1.0.4: mekanisme inject PINDAH TOTAL ke kerangka Traffic Rider
      * (injector.c). Injector TR mengembalikan exit 0 bila ia sempat
@@ -444,10 +487,9 @@ object InjectorBridge {
         }
         val (staged, stageLog) = stagePayload(context)
         val nativePayload = resolveNativeLib(context, PAYLOAD_LIB) ?: payloadPath(context)
-        val primary = staged ?: nativePayload
-        val attempts = arrayOf(primary, nativePayload, primary)
+        val attempts = arrayOf(nativePayload, staged ?: nativePayload, nativePayload)
         var last: InjectResult? = null
-        val allDiag = StringBuilder("injector: $injector (kerangka TR v1.0.5)\n$stageLog")
+        val allDiag = StringBuilder("injector: $injector (kerangka TR v1.0.6)\n$stageLog")
         // Hapus hasil inject lama supaya percobaan ini tidak membaca
         // JSON basi (pola TR).
         RootUtil.su("rm -f '$INJECT_RESULT'")

@@ -57,6 +57,23 @@ constexpr const char* kConfigPath = "/data/data/com.fungames.sniper3d/cache/hozi
 constexpr const char* kEspPath = "/data/data/com.fungames.sniper3d/cache/hozinsniper_esp.json";
 constexpr const char* kStatusCache = "/data/data/com.fungames.sniper3d/cache/hozinsniper_payload.log";
 constexpr const char* kStatusTmp = "/data/local/tmp/hozinsniper_payload.log";
+// Kanal status KETIGA (v1.0.6): external files game — game UID bisa
+// tulis dir external-nya sendiri tanpa permission, root bisa baca
+// /sdcard. Dipakai bila cache + /data/local/tmp sama-sama tak bisa
+// ditulis proses game (bukti tes v1.0.5: status + ctor kosong).
+constexpr const char* kStatusExt = "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_payload.log";
+
+void mkdir_p_ext() {
+    // mkdir per komponen (abaikan EEXIST) — /sdcard/Android/data
+    // biasanya sudah ada; yang belum ada hanya .../com.fungames.../files.
+    const char* parts[] = {
+        "/sdcard/Android",
+        "/sdcard/Android/data",
+        "/sdcard/Android/data/com.fungames.sniper3d",
+        "/sdcard/Android/data/com.fungames.sniper3d/files",
+    };
+    for (const char* p : parts) mkdir(p, 0755);
+}
 
 // ---------------------------------------------------------------- state
 struct Config {
@@ -181,6 +198,9 @@ struct State {
     // supaya worker bisa baca tanpa lock tiap 150 ms.
     std::atomic<long long> lastPumpMs{0};
     long long lastPumpModeMs = 0;
+    // Timestamp mode pertama kali jadi MISI (v1.0.6 — gate stabil pompa):
+    // 0 = bukan MISI. Hanya pompa main-thread yang menyentuh ini.
+    long long misiSinceMs = 0;
     long long lastEnumerateMs = 0;
     long long lastPumpHookMs = 0;
     float zoomScaleMaxOrig = 0;
@@ -268,6 +288,8 @@ void write_status(const std::string& status) {
     g.lastStatus = status;
     write_file(kStatusCache, content);
     write_file(kStatusTmp, content);
+    mkdir_p_ext();
+    write_file(kStatusExt, content);
     g.lastStatusWriteMs = now_ms();
 }
 
@@ -280,6 +302,14 @@ void crash_handler(int sig) {
         close(fd);
     }
     fd = open(kStatusTmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        (void)write(fd, msg, std::strlen(msg));
+        close(fd);
+    }
+    // Kanal ketiga — tanpa mkdir (konteks signal): dir sudah dibuat
+    // write_status("INIT") di awal worker; bila belum ada, open gagal
+    // diam-diam seperti dua kanal di atas.
+    fd = open(kStatusExt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         (void)write(fd, msg, std::strlen(msg));
         close(fd);
@@ -987,7 +1017,19 @@ void pump_main_thread() {
         std::lock_guard<std::mutex> lock(g.stateMutex);
         mode = g.mode;
     }
+    // Gate stabil (v1.0.6): enumerate/apply/hook HANYA bila MISI sudah
+    // stabil >= 2000 ms. Crash tes v1.0.5 pindah ke "loading mau ke
+    // ingame" — saat transisi scene, objek Person dibuat/dihancurkan
+    // dan FindObjectsOfType di tengah transisi tersangka utamanya.
+    // Selama transisi, pompa hanya menjalankan update_mode() di atas.
     if (mode == Mode::MISI) {
+        if (g.misiSinceMs == 0) g.misiSinceMs = t;
+    } else {
+        g.misiSinceMs = 0;
+    }
+    const bool misiStabil = mode == Mode::MISI && g.misiSinceMs != 0 &&
+                            t - g.misiSinceMs >= 2000;
+    if (misiStabil) {
         // Enumerasi + fitur tiap 100 ms (throttle — Update jalan 60x/dtk).
         if (t - g.lastEnumerateMs >= 100) {
             enumerate_and_target();
@@ -1001,7 +1043,7 @@ void pump_main_thread() {
     // Pasang/refresh hook ShootTest tiap 2 dtk (ganti senjata → subclass
     // lain → hook dipasang ulang). Dulu di worker — pindah ke sini
     // karena try_install_hook memanggil FindObjectsOfType.
-    if (t - g.lastPumpHookMs >= 2000) {
+    if (misiStabil && t - g.lastPumpHookMs >= 2000) {
         try_install_hook();
         g.lastPumpHookMs = t;
     }
