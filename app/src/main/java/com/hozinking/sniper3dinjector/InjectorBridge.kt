@@ -69,6 +69,16 @@ object InjectorBridge {
     private const val CTOR_LOG_EXT =
         "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_ctor.log"
 
+    /** Bukti crash (v1.0.8): crash.json HANYA ditulis crash handler
+     *  payload — worker tidak pernah menimpanya, jadi penanda crash
+     *  selamat dari inject ulang (sebelumnya STATUS=CRASH ditimpa
+     *  INIT/READY tiap 2 dtk). Urutan baca: external → cache → tmp. */
+    private const val CRASH_EXT =
+        "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_crash.json"
+    private const val CRASH_CACHE =
+        "/data/data/com.fungames.sniper3d/cache/hozinsniper_crash.json"
+    private const val CRASH_TMP = "/data/local/tmp/hozinsniper_crash.json"
+
     /** Config toggle + data ESP (keduanya di cache game). */
     const val CONFIG_PATH = "$GAME_CACHE_DIR/hozinsniper_config.json"
     const val ESP_PATH = "$GAME_CACHE_DIR/hozinsniper_esp.json"
@@ -186,6 +196,56 @@ object InjectorBridge {
                 "if [ -s \"\$f\" ]; then echo \"SRC=\$f\"; cat \"\$f\"; break; fi; done"
         )
         return splitSrc(r.output.trim())
+    }
+
+    /** Baca crash.json terakhir (external → cache → tmp). "" bila tak ada. */
+    fun readCrashJson(): String {
+        val r = RootUtil.su(
+            "for f in '$CRASH_EXT' '$CRASH_CACHE' '$CRASH_TMP'; do " +
+                "if [ -s \"\$f\" ]; then cat \"\$f\"; break; fi; done"
+        )
+        return r.output.trim()
+    }
+
+    /** Satu baris ringkas dari crash.json, mis. "crash terakhir: sinyal
+     *  11, 18 Nov 08:04, fase after-orig, pompa ke-3, mode MISI".
+     *  "" bila tak ada / tak bisa diparse. */
+    fun crashSummary(raw: String): String {
+        if (raw.isEmpty()) return ""
+        fun strVal(key: String): String {
+            val pat = "\"$key\":\""
+            val i = raw.indexOf(pat)
+            if (i < 0) return ""
+            val s = i + pat.length
+            val e = raw.indexOf('"', s)
+            return if (e > s) raw.substring(s, e) else ""
+        }
+        fun numVal(key: String): String {
+            val pat = "\"$key\":"
+            val i = raw.indexOf(pat)
+            if (i < 0) return ""
+            val s = i + pat.length
+            var e = s
+            while (e < raw.length && (raw[e].isDigit() || raw[e] == '-')) e++
+            return if (e > s) raw.substring(s, e) else ""
+        }
+        val sig = numVal("signal")
+        if (sig.isEmpty()) return ""
+        val epoch = numVal("t_epoch").toLongOrNull()
+        val whenStr = if (epoch != null) {
+            java.text.SimpleDateFormat("dd MMM HH:mm", java.util.Locale.US)
+                .format(java.util.Date(epoch * 1000))
+        } else ""
+        val phase = strVal("phase")
+        val calls = numVal("pump_calls")
+        val mode = strVal("mode")
+        val failed = strVal("failed")
+        return "crash terakhir: sinyal $sig" +
+            (if (whenStr.isNotEmpty()) ", $whenStr" else "") +
+            (if (phase.isNotEmpty()) ", fase $phase" else "") +
+            (if (calls.isNotEmpty()) ", pompa ke-$calls" else "") +
+            (if (mode.isNotEmpty()) ", mode $mode" else "") +
+            (if (failed.isNotEmpty() && failed != "-") ", gagal: $failed" else "")
     }
 
     /** Pisah baris marker "SRC=<path>" dari isi file. */

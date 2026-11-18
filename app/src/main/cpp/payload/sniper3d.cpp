@@ -32,6 +32,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
@@ -62,6 +63,14 @@ constexpr const char* kStatusTmp = "/data/local/tmp/hozinsniper_payload.log";
 // /sdcard. Dipakai bila cache + /data/local/tmp sama-sama tak bisa
 // ditulis proses game (bukti tes v1.0.5: status + ctor kosong).
 constexpr const char* kStatusExt = "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_payload.log";
+// Bukti crash TERPISAH (v1.0.8): crash.json HANYA ditulis crash handler —
+// worker TIDAK PERNAH menimpanya (sebelumnya STATUS=CRASH ditimpa
+// INIT/READY tiap 2 dtk, jadi diagnosis tak pernah melihat crash).
+// pump_trace.txt: jejak 5 pemanggilan pompa pertama (lihat trace_pump).
+constexpr const char* kCrashCache = "/data/data/com.fungames.sniper3d/cache/hozinsniper_crash.json";
+constexpr const char* kCrashTmp = "/data/local/tmp/hozinsniper_crash.json";
+constexpr const char* kCrashExt = "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_crash.json";
+constexpr const char* kPumpTraceExt = "/sdcard/Android/data/com.fungames.sniper3d/files/hozinsniper_pump_trace.txt";
 
 void mkdir_p_ext() {
     // mkdir per komponen (abaikan EEXIST) — /sdcard/Android/data
@@ -213,6 +222,14 @@ struct State {
     // deteksi basi (level selesai / menu / Update tak jalan). Atomic
     // supaya worker bisa baca tanpa lock tiap 150 ms.
     std::atomic<long long> lastPumpMs{0};
+    // Jejak pompa (v1.0.8): hitung pemanggilan hook Update + fase
+    // terakhir — dibaca crash_handler (atomic = aman dari signal).
+    // Fase: 0=idle 1=enter 2=after-orig 3=after-pump.
+    std::atomic<long long> pumpCalls{0};
+    std::atomic<int> pumpPhase{0};
+    // Snapshot daftar failed untuk crash.json — diperbarui add_failed
+    // (konteks normal, di bawah lock); crash handler hanya MEMBACA.
+    char failedSnapshot[256] = "-";
     long long lastPumpModeMs = 0;
     // Timestamp mode pertama kali jadi MISI (v1.0.6 — gate stabil pompa):
     // 0 = bukan MISI. Hanya pompa main-thread yang menyentuh ini.
@@ -309,6 +326,38 @@ void write_status(const std::string& status) {
     g.lastStatusWriteMs = now_ms();
 }
 
+// Async-signal-safe: append bilangan/desimal ke buffer (tanpa snprintf).
+size_t append_ll(char* buf, size_t pos, size_t cap, long long v) {
+    char tmp[24];
+    int n = 0;
+    bool neg = v < 0;
+    unsigned long long u = neg ? (unsigned long long)(-v) : (unsigned long long)v;
+    if (u == 0) tmp[n++] = '0';
+    while (u > 0) {
+        tmp[n++] = (char)('0' + (u % 10));
+        u /= 10;
+    }
+    if (neg && pos < cap) buf[pos++] = '-';
+    while (n > 0 && pos < cap) buf[pos++] = tmp[--n];
+    return pos;
+}
+
+size_t append_str(char* buf, size_t pos, size_t cap, const char* s) {
+    while (*s && pos < cap) buf[pos++] = *s++;
+    return pos;
+}
+
+void write_crash_json(const char* buf, size_t len) {
+    const char* paths[3] = {kCrashCache, kCrashTmp, kCrashExt};
+    for (const char* path : paths) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)write(fd, buf, len);
+            close(fd);
+        }
+    }
+}
+
 void crash_handler(int sig) {
     // Async-signal-safe: open/write/close langsung (tanpa stdio).
     const char* msg = "STATUS=CRASH\nFAILED=signal\nLIBSIZE=-\nMODE=UNKNOWN\nHOOK=gagal\n";
@@ -330,6 +379,38 @@ void crash_handler(int sig) {
         (void)write(fd, msg, std::strlen(msg));
         close(fd);
     }
+    // crash.json TERPISAH (v1.0.8): sinyal, waktu (epoch), mode, jumlah
+    // pemanggilan pompa, fase pompa terakhir, daftar failed. Worker
+    // TIDAK PERNAH menulis file ini — penanda crash selamat dari
+    // inject ulang. time() + clock_gettime aman dari signal; mode dan
+    // failedSnapshot dibaca best-effort (word-sized / NUL-terminated).
+    char json[512];
+    size_t p = 0;
+    p = append_str(json, p, sizeof(json), "{\"signal\":");
+    p = append_ll(json, p, sizeof(json), sig);
+    p = append_str(json, p, sizeof(json), ",\"t_epoch\":");
+    p = append_ll(json, p, sizeof(json), (long long)time(nullptr));
+    p = append_str(json, p, sizeof(json), ",\"mode\":\"");
+    Mode m = g.mode;
+    p = append_str(json, p, sizeof(json),
+                   m == Mode::MISI ? "MISI" : m == Mode::ARENA ? "ARENA" : "UNKNOWN");
+    p = append_str(json, p, sizeof(json), "\",\"pump_calls\":");
+    p = append_ll(json, p, sizeof(json), g.pumpCalls.load());
+    p = append_str(json, p, sizeof(json), ",\"phase\":\"");
+    int ph = g.pumpPhase.load();
+    p = append_str(json, p, sizeof(json),
+                   ph == 1 ? "enter" : ph == 2 ? "after-orig" : ph == 3 ? "after-pump" : "idle");
+    p = append_str(json, p, sizeof(json), "\",\"failed\":\"");
+    char snap[256];
+    for (int i = 0; i < 255; i++) {
+        snap[i] = g.failedSnapshot[i];
+        if (snap[i] == '\0') break;
+    }
+    snap[255] = '\0';
+    p = append_str(json, p, sizeof(json), snap);
+    p = append_str(json, p, sizeof(json), "\"}\n");
+    if (p < sizeof(json)) json[p] = '\0';
+    write_crash_json(json, p);
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -341,6 +422,14 @@ void add_failed(const std::string& name) {
     if (std::find(g.failed.begin(), g.failed.end(), name) == g.failed.end()) {
         g.failed.push_back(name);
     }
+    // Snapshot untuk crash.json (konteks normal — crash handler hanya baca).
+    std::string joined;
+    for (size_t i = 0; i < g.failed.size(); i++) {
+        if (i) joined += ",";
+        joined += g.failed[i];
+    }
+    if (joined.empty()) joined = "-";
+    std::snprintf(g.failedSnapshot, sizeof(g.failedSnapshot), "%s", joined.c_str());
 }
 
 bool failed_empty() {
@@ -646,12 +735,17 @@ void update_mode() {
     Mode m = Mode::UNKNOWN;
     if (g.levelClass && g.arenaClass && g.arenaFluxClass) {
         bool level = !find_objects(g.levelClass).empty();
-        bool arena = !find_objects(g.arenaClass).empty();
-        bool flux = !find_objects(g.arenaFluxClass).empty();
-        if (level && !arena && !flux) {
-            m = Mode::MISI;
-        } else if (arena || flux) {
-            m = Mode::ARENA;
+        // v1.0.8: bila LevelController 0 (menu / loading / level selesai),
+        // mode UNKNOWN dan cek Arena DILEWATI siklus ini — enumerasi
+        // ganda saat transisi scene tersangka crash loading (tes v1.0.7).
+        if (level) {
+            bool arena = !find_objects(g.arenaClass).empty();
+            bool flux = !find_objects(g.arenaFluxClass).empty();
+            if (!arena && !flux) {
+                m = Mode::MISI;
+            } else {
+                m = Mode::ARENA;
+            }
         }
     }
     // Panggilan Unity di atas jalan di luar lock; assign di bawah lock.
@@ -1142,7 +1236,26 @@ void pump_main_thread() {
     g.prevPumpConfig = cfg;
 }
 
+// Jejak 5 pemanggilan pompa pertama (v1.0.8): tiap baris fopen-append
+// + fclose langsung supaya selamat dari crash. Membedakan crash di
+// trampoline/orig (enter tanpa orig-ok) vs di pompa (orig-ok tanpa
+// pump-ok). Bila crash di trampoline SEBELUM hook body jalan, trace
+// berhenti di pump-ok panggilan sebelumnya — itu sendiri petunjuknya.
+void trace_pump(const char* tag, long long n) {
+    mkdir_p_ext();
+    char line[64];
+    std::snprintf(line, sizeof(line), "%s %lld\n", tag, n);
+    FILE* f = std::fopen(kPumpTraceExt, "a");
+    if (f) {
+        std::fwrite(line, 1, std::strlen(line), f);
+        std::fclose(f);
+    }
+}
+
 void hook_LevelUpdate(void* thiz, void* method) {
+    long long n = ++g.pumpCalls;  // 1-based; atomic (dibaca crash handler)
+    g.pumpPhase.store(1);
+    if (n <= 5) trace_pump("enter", n);
     LevelUpdateFn orig = nullptr;
     void* mp = method ? reinterpret_cast<Il2CppMethodOpaque*>(method)->methodPointer : nullptr;
     if (mp) {
@@ -1152,9 +1265,13 @@ void hook_LevelUpdate(void* thiz, void* method) {
         orig = g_origLevelUpdate.begin()->second;
     }
     if (orig) orig(thiz, method);  // original dulu
+    g.pumpPhase.store(2);
+    if (n <= 5) trace_pump("orig-ok", n);
     // Bila orig tak dikenal, satu frame Update terlewat (aman) — pompa
     // tetap jalan, ia tidak bergantung pada orig.
     pump_main_thread();
+    g.pumpPhase.store(3);
+    if (n <= 5) trace_pump("pump-ok", n);
 }
 
 void try_install_pump_hook() {

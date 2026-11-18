@@ -177,6 +177,11 @@ class MainActivity : AppCompatActivity() {
                     if (ctorSrc.isNotEmpty()) log("ctor log dari: $ctorSrc")
                     log("--- ctor log ---\n$ctorLog")
                 }
+                // v1.0.8: bukti crash dari run sebelumnya (crash.json hanya
+                // ditulis crash handler — selamat dari inject ulang).
+                // Lewat log() supaya ikut masuk file log run v1.0.7.
+                val crash = InjectorBridge.crashSummary(InjectorBridge.readCrashJson())
+                if (crash.isNotEmpty()) log(crash)
                 val pidFinal = InjectorBridge.findPid(InjectorBridge.TARGET_PACKAGE)
                 log(
                     if (pidFinal != null) "game: masih jalan (pid $pidFinal)"

@@ -39,8 +39,19 @@ void mkdir_p_ext() {
     for (const char* p : parts) mkdir(p, 0755);
 }
 
-void write_ctor(const char* line) {
-    std::string content = line;
+// v1.0.8: tiap run bersih — sebelumnya ctor log terakumulasi antar
+// run (log user: CTOR 2x dari 2 run), mengaburkan run yang crash.
+// Bukti crash kini tinggal di crash.json (tak pernah ditimpa worker).
+void truncate_ctor_logs() {
+    mkdir_p_ext();
+    const char* paths[3] = {kCtorCache, kCtorTmp, kCtorExt};
+    for (const char* p : paths) {
+        FILE* f = std::fopen(p, "w");
+        if (f) std::fclose(f);
+    }
+}
+
+void write_ctor(const char* line) {    std::string content = line;
     content += "\n";
     FILE* f = std::fopen(kCtorCache, "a");
     if (f) {
@@ -63,6 +74,7 @@ void write_ctor(const char* line) {
 }  // namespace
 
 __attribute__((constructor)) static void on_load() {
+    truncate_ctor_logs();
     write_ctor("CTOR=masuk");
     LOGI("payload Hozin Sniper 3D v1.0.6 masuk ke proses game");
     sniper3d::start_worker();
